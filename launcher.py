@@ -122,6 +122,67 @@ def run_cmd(cmd, cwd=None, timeout=120):
     except subprocess.TimeoutExpired:
         return 1, f"Command timed out after {timeout}s"
 
+def run_cmd_stream(cmd, cwd, log_fn, label="", timeout=300):
+    """Run a command with live streaming output and elapsed-time updates.
+    Streams stdout/stderr line by line to log_fn. Shows elapsed time
+    every 3 seconds on lines with no output so the user always knows
+    something is happening. Returns (returncode, full_output)."""
+    import time as _time
+    log_fn(f"{label} Running: {' '.join(cmd)}", FG_DIM)
+    try:
+        proc = subprocess.Popen(
+            cmd, cwd=str(cwd) if cwd else None,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, bufsize=1,
+        )
+    except FileNotFoundError:
+        log_fn(f"{label} Command not found: {cmd[0]}", RED)
+        return 1, f"Command not found: {cmd[0]}"
+
+    output_lines = []
+    start = _time.time()
+    last_tick = start
+
+    def elapsed():
+        s = int(_time.time() - start)
+        if s < 60:
+            return f"{s}s"
+        return f"{s // 60}m {s % 60}s"
+
+    # Read line by line with periodic heartbeat
+    import selectors
+    sel = selectors.DefaultSelector()
+    sel.register(proc.stdout, selectors.EVENT_READ)
+    while True:
+        # Wait up to 3s for output
+        events = sel.select(timeout=3)
+        now = _time.time()
+        if events:
+            line = proc.stdout.readline()
+            if not line:
+                break  # EOF
+            line = line.rstrip()
+            if line:
+                output_lines.append(line)
+                log_fn(f"{label} {line}", FG_DIM)
+                last_tick = now
+        else:
+            # No output for 3s — show heartbeat
+            if now - last_tick >= 3:
+                log_fn(f"{label} ... working ({elapsed()} elapsed)", FG_DIM)
+                last_tick = now
+        # Timeout guard
+        if now - start > timeout:
+            proc.kill()
+            sel.close()
+            log_fn(f"{label} Timed out after {timeout}s", RED)
+            return 1, "\n".join(output_lines)
+    sel.close()
+    proc.wait()
+    total = elapsed()
+    log_fn(f"{label} Completed in {total} (exit {proc.returncode})", FG_DIM)
+    return proc.returncode, "\n".join(output_lines)
+
 # ── DOCKER HELPERS ────────────────────────────────────────────────────────────
 
 def check_docker_installed():
@@ -132,8 +193,10 @@ def docker_up(cwd, log_fn, cfg=None):
     cfg = cfg or DEFAULT_CONFIG
     port = cfg.get("port", 3000)
     log_fn("[DOCKER] Building & starting container ...", AMBER)
-    code, out = run_cmd(["docker", "compose", "up", "-d", "--build"], cwd=cwd)
-    log_fn(out.strip() or "(no output)", FG_DIM)
+    code, out = run_cmd_stream(
+        ["docker", "compose", "up", "-d", "--build"],
+        cwd=cwd, log_fn=log_fn, label="[DOCKER]", timeout=600,
+    )
     if code != 0:
         log_fn("[DOCKER] Failed — is Docker running?", RED)
         return False
@@ -144,8 +207,12 @@ def docker_up(cwd, log_fn, cfg=None):
 
 def docker_down(cwd, log_fn):
     log_fn("[DOCKER] Stopping container ...", AMBER)
-    code, out = run_cmd(["docker", "compose", "down"], cwd=cwd)
-    log_fn(out.strip() or "(no output)", FG_DIM)
+    code, out = run_cmd_stream(
+        ["docker", "compose", "down"],
+        cwd=cwd, log_fn=log_fn, label="[DOCKER]", timeout=120,
+    )
+    if code != 0:
+        log_fn("[DOCKER] Stop may have failed — check manually.", RED)
     return code == 0
 
 def _parse_size(s):
@@ -199,12 +266,12 @@ def docker_stats():
 
 def install_docker(log_fn):
     if sys.platform == "win32":
-        log_fn("[DOCKER] Attempting install via winget ...", AMBER)
-        code, out = run_cmd([
+        log_fn("[DOCKER] Installing Docker Desktop via winget — this may take several minutes ...", AMBER)
+        code, out = run_cmd_stream([
             "winget", "install", "Docker.DockerDesktop",
             "--silent", "--accept-package-agreements",
             "--accept-source-agreements",
-        ], timeout=300)
+        ], cwd=None, log_fn=log_fn, label="[INSTALL]", timeout=600)
         if code == 0:
             log_fn("[DOCKER] Installed! Start Docker Desktop, then retry.", GREEN)
             return True
@@ -213,9 +280,11 @@ def install_docker(log_fn):
         log_fn("[DOCKER] Install Docker Desktop, then retry.", AMBER)
         return False
     else:
-        log_fn("[DOCKER] Attempting install via get.docker.com ...", AMBER)
-        code, out = run_cmd(
-            ["bash", "-c", "curl -fsSL https://get.docker.com | sh"], timeout=300)
+        log_fn("[DOCKER] Installing Docker via get.docker.com — this may take several minutes ...", AMBER)
+        code, out = run_cmd_stream(
+            ["bash", "-c", "curl -fsSL https://get.docker.com | sh"],
+            cwd=None, log_fn=log_fn, label="[INSTALL]", timeout=600,
+        )
         if code == 0:
             user = get_username()
             run_cmd(["sudo", "usermod", "-aG", "docker", user], timeout=10)
@@ -303,18 +372,27 @@ def create_pyz(src_dir, log_fn):
     dest = get_backups_dir() / f"kappa-roadmap-{ts}.pyz"
     log_fn(f"[PACK] Creating {dest.name} ...", AMBER)
     launcher_src = get_launcher_source()
+    # Count files first for progress
+    files = []
+    for f in src_dir.rglob("*"):
+        if not f.is_file():
+            continue
+        rel = f.relative_to(src_dir)
+        if any(part in EXCLUDE_DIRS for part in rel.parts):
+            continue
+        if rel.suffix in EXCLUDE_EXTS or rel.name == "launcher.py":
+            continue
+        files.append((f, rel))
+    total = len(files)
+    log_fn(f"[PACK] Packing {total} files ...", FG_DIM)
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as z:
         z.writestr("__main__.py", launcher_src)
-        for f in src_dir.rglob("*"):
-            if not f.is_file():
-                continue
-            rel = f.relative_to(src_dir)
-            if any(part in EXCLUDE_DIRS for part in rel.parts):
-                continue
-            if rel.suffix in EXCLUDE_EXTS or rel.name == "launcher.py":
-                continue
+        for i, (f, rel) in enumerate(files, 1):
             z.writestr(f"app/{rel.as_posix()}", f.read_bytes())
+            if i % 20 == 0 or i == total:
+                pct = int(i / total * 100)
+                log_fn(f"[PACK] {i}/{total} files ({pct}%)", FG_DIM)
     with open(dest, "wb") as fh:
         fh.write(b"#!/usr/bin/env python3\n")
         fh.write(buf.getvalue())
@@ -354,12 +432,14 @@ def write_bootstrap_scripts(target_dir, log_fn):
     log_fn("[PACK] Bootstrap: launch.bat + launch.sh", GREEN)
 
 def extract_from_pyz(pyz_path, target, log_fn):
-    log_fn(f"[UNPACK] -> {target}", CYAN)
+    log_fn(f"[UNPACK] Extracting to {target} ...", CYAN)
     target.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(str(pyz_path), 'r') as z:
-        for info in z.infolist():
-            if not info.filename.startswith("app/") or len(info.filename) <= 4:
-                continue
+        app_entries = [i for i in z.infolist()
+                       if i.filename.startswith("app/") and len(i.filename) > 4]
+        total = len(app_entries)
+        log_fn(f"[UNPACK] {total} files to extract ...", FG_DIM)
+        for idx, info in enumerate(app_entries, 1):
             rel = info.filename[4:]
             dest_path = target / rel
             if info.filename.endswith('/'):
@@ -368,6 +448,9 @@ def extract_from_pyz(pyz_path, target, log_fn):
                 dest_path.parent.mkdir(parents=True, exist_ok=True)
                 with z.open(info) as sf, open(dest_path, 'wb') as df:
                     df.write(sf.read())
+            if idx % 20 == 0 or idx == total:
+                pct = int(idx / total * 100)
+                log_fn(f"[UNPACK] {idx}/{total} files ({pct}%)", FG_DIM)
     log_fn("[UNPACK] Done.", GREEN)
     return True
 
