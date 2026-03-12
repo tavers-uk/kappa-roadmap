@@ -212,9 +212,150 @@ def run_cmd_stream(cmd, cwd, log_fn, label="", timeout=300):
 
 # ── DOCKER HELPERS ────────────────────────────────────────────────────────────
 
+def check_virtualization():
+    """Check if WSL2 or Hyper-V is available (Windows only). Returns (ok, detail)."""
+    if sys.platform != "win32":
+        return True, "Linux — native containers"
+    # Check WSL2 first (preferred Docker Desktop backend)
+    code, out = run_cmd(["wsl", "--status"], timeout=10)
+    wsl_ok = code == 0 and "not installed" not in out.lower()
+    if wsl_ok:
+        return True, "WSL2 available"
+    # Check if WSL can be installed (feature exists but not enabled)
+    code2, out2 = run_cmd(["wsl", "--list", "--quiet"], timeout=5)
+    # Check Hyper-V via WMI (doesn't need elevation)
+    code3, out3 = run_cmd([
+        "powershell.exe", "-NoProfile", "-Command",
+        "(Get-CimInstance Win32_ComputerSystem).HypervisorPresent"
+    ], timeout=10)
+    hypervisor = "true" in out3.lower() if code3 == 0 else False
+    if hypervisor:
+        return True, "Hypervisor present (Hyper-V/WSL2 capable)"
+    # Check BIOS virtualization support
+    code4, out4 = run_cmd([
+        "powershell.exe", "-NoProfile", "-Command",
+        "(Get-CimInstance Win32_Processor).VirtualizationFirmwareEnabled"
+    ], timeout=10)
+    virt_bios = "true" in out4.lower() if code4 == 0 else False
+    if not virt_bios:
+        return False, "Virtualization disabled in BIOS — enable VT-x/AMD-V in BIOS settings"
+    # Virtualization is on in BIOS but WSL2/Hyper-V not installed
+    return False, "WSL2 not installed — run 'wsl --install' in an admin terminal, then reboot"
+
+def _find_docker_exe():
+    """Find docker executable — checks PATH first, then common install locations."""
+    # Try bare command first (works if PATH is set)
+    code, _ = run_cmd(["docker", "--version"], timeout=5)
+    if code == 0:
+        return "docker"
+    # Windows: check standard install paths
+    if sys.platform == "win32":
+        candidates = [
+            os.path.expandvars(r"%ProgramFiles%\Docker\Docker\resources\bin\docker.exe"),
+            os.path.expandvars(r"%LOCALAPPDATA%\Docker\resources\bin\docker.exe"),
+            os.path.expandvars(r"%ProgramFiles%\Docker\Docker\Docker Desktop.exe"),
+        ]
+        for p in candidates:
+            if os.path.isfile(p) and p.endswith("docker.exe"):
+                # Add to PATH for this session so all subsequent calls work
+                bin_dir = os.path.dirname(p)
+                if bin_dir not in os.environ.get("PATH", ""):
+                    os.environ["PATH"] = bin_dir + ";" + os.environ.get("PATH", "")
+                code, _ = run_cmd([p, "--version"], timeout=5)
+                if code == 0:
+                    return p
+    return None
+
+_DOCKER_EXE = None
+def docker_exe():
+    """Return path to docker executable (cached)."""
+    global _DOCKER_EXE
+    if _DOCKER_EXE is None:
+        _DOCKER_EXE = _find_docker_exe() or "docker"
+    return _DOCKER_EXE
+
 def check_docker_installed():
-    code, _ = run_cmd(["docker", "--version"], timeout=10)
+    return _find_docker_exe() is not None
+
+def check_docker_running():
+    """Check if Docker daemon is actually running (not just installed)."""
+    exe = docker_exe()
+    code, out = run_cmd([exe, "info"], timeout=8)
     return code == 0
+
+def ensure_wsl(log_fn):
+    """Install WSL2 if missing (Windows only). Returns True if WSL2 is available."""
+    if sys.platform != "win32":
+        return True
+    code, out = run_cmd(["wsl", "--status"], timeout=10)
+    if code == 0 and "not installed" not in out.lower():
+        return True
+    log_fn("[WSL] WSL2 not installed. Installing (requires admin)...", AMBER)
+    # --no-prompt skips all EULA/confirmation prompts
+    code, out = run_cmd_stream(
+        ["wsl", "--install", "--no-prompt"],
+        cwd=None, log_fn=log_fn, label="[WSL]", timeout=300,
+    )
+    if code == 0:
+        log_fn("[WSL] Installed. A reboot may be required for WSL2 to fully activate.", GREEN)
+        return True
+    # Try the older syntax
+    code2, out2 = run_cmd_stream(
+        ["wsl", "--install", "-d", "Ubuntu", "--no-prompt"],
+        cwd=None, log_fn=log_fn, label="[WSL]", timeout=300,
+    )
+    if code2 == 0:
+        log_fn("[WSL] Installed. A reboot may be required.", GREEN)
+        return True
+    log_fn("[WSL] Auto-install failed. Run 'wsl --install' in an admin terminal, then reboot.", RED)
+    return False
+
+def start_docker_desktop(log_fn):
+    """Attempt to launch Docker Desktop and wait for daemon to be ready."""
+    # Pre-check: virtualization must be available or Docker Desktop will just hang
+    virt_ok, virt_detail = check_virtualization()
+    if not virt_ok:
+        log_fn(f"[DOCKER] Cannot start — {virt_detail}", RED)
+        return False
+    if sys.platform != "win32":
+        log_fn("[DOCKER] On Linux, start the daemon with: sudo systemctl start docker", AMBER)
+        return False
+    # Ensure WSL2 is present (Docker Desktop backend)
+    ensure_wsl(log_fn)
+    desktop_paths = [
+        os.path.expandvars(r"%ProgramFiles%\Docker\Docker\Docker Desktop.exe"),
+        os.path.expandvars(r"%LOCALAPPDATA%\Docker\Docker Desktop.exe"),
+    ]
+    launched = False
+    for dp in desktop_paths:
+        if os.path.isfile(dp):
+            log_fn("[DOCKER] Launching Docker Desktop (auto-accepting license)...", AMBER)
+            try:
+                # --accept-license skips the EULA popup on first run
+                subprocess.Popen(
+                    [dp, "--accept-license"],
+                    creationflags=0x00000008,  # DETACHED_PROCESS
+                )
+                launched = True
+                break
+            except Exception as e:
+                log_fn(f"[DOCKER] Failed to launch: {e}", RED)
+    if not launched:
+        log_fn("[DOCKER] Could not find Docker Desktop. Start it manually.", AMBER)
+        return False
+    # Wait for daemon
+    import time as _t
+    log_fn("[DOCKER] Waiting for Docker daemon to start (usually 15-45s)...", AMBER)
+    for i in range(60):
+        _t.sleep(2)
+        elapsed = (i + 1) * 2
+        if check_docker_running():
+            log_fn(f"[DOCKER] Daemon ready after {elapsed}s.", GREEN)
+            return True
+        if elapsed % 10 == 0:
+            log_fn(f"[DOCKER] Still waiting... ({elapsed}s / 120s)", AMBER)
+    log_fn("[DOCKER] Daemon did not start within 120s. Start Docker Desktop manually.", RED)
+    return False
 
 _COMPOSE_CMD = None
 def compose_cmd():
@@ -222,29 +363,36 @@ def compose_cmd():
     global _COMPOSE_CMD
     if _COMPOSE_CMD is not None:
         return list(_COMPOSE_CMD)
+    exe = docker_exe()
     # Try V2 plugin first (docker compose)
-    code, _ = run_cmd(["docker", "compose", "version"], timeout=5)
+    code, _ = run_cmd([exe, "compose", "version"], timeout=5)
     if code == 0:
-        _COMPOSE_CMD = ["docker", "compose"]
+        _COMPOSE_CMD = [exe, "compose"]
         return list(_COMPOSE_CMD)
     # Fall back to V1 standalone (docker-compose)
     code, _ = run_cmd(["docker-compose", "version"], timeout=5)
     if code == 0:
         _COMPOSE_CMD = ["docker-compose"]
         return list(_COMPOSE_CMD)
-    _COMPOSE_CMD = ["docker", "compose"]  # default
+    _COMPOSE_CMD = [exe, "compose"]  # default
     return list(_COMPOSE_CMD)
 
 def docker_up(cwd, log_fn, cfg=None):
     cfg = cfg or DEFAULT_CONFIG
     port = cfg.get("port", 3000)
+    # Pre-check: is Docker daemon running?
+    if not check_docker_running():
+        log_fn("[DOCKER] Daemon not running — attempting to start Docker Desktop...", AMBER)
+        if not start_docker_desktop(log_fn):
+            log_fn("[DOCKER] Cannot proceed without Docker daemon. Start Docker Desktop and retry.", RED)
+            return False
     log_fn("[DOCKER] Building & starting container ...", AMBER)
     code, out = run_cmd_stream(
         compose_cmd() + ["up", "-d", "--build"],
         cwd=cwd, log_fn=log_fn, label="[DOCKER]", timeout=600,
     )
     if code != 0:
-        log_fn("[DOCKER] Failed — is Docker running?", RED)
+        log_fn("[DOCKER] Build/start failed. Check the logs above for details.", RED)
         return False
     log_fn(f"[DOCKER] Live at http://localhost:{port}", GREEN)
     if cfg.get("auto_open_browser", True):
@@ -275,7 +423,7 @@ def _parse_size(s):
 def docker_stats():
     """Get container CPU/RAM/NET/PIDs. Returns dict or None."""
     code, out = run_cmd(
-        ["docker", "stats", CONTAINER_NAME, "--no-stream",
+        [docker_exe(), "stats", CONTAINER_NAME, "--no-stream",
          "--format", "{{.CPUPerc}}|{{.MemUsage}}|{{.NetIO}}|{{.PIDs}}"],
         timeout=8,
     )
@@ -310,20 +458,75 @@ def docker_stats():
     except Exception:
         return None
 
+def _refresh_path_windows():
+    """Refresh PATH from registry so newly-installed programs are found."""
+    if sys.platform != "win32":
+        return
+    try:
+        import winreg
+        # System PATH
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                            r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment") as key:
+            sys_path = winreg.QueryValueEx(key, "Path")[0]
+        # User PATH
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Environment") as key:
+            usr_path = winreg.QueryValueEx(key, "Path")[0]
+        os.environ["PATH"] = sys_path + ";" + usr_path
+    except Exception:
+        pass
+
+def _wait_for_docker(log_fn, timeout=120):
+    """After install, wait for docker to become available. Returns True if found."""
+    import time as _t
+    log_fn(f"[DOCKER] Waiting for Docker to become available (up to {timeout}s)...", AMBER)
+    start = _t.time()
+    while _t.time() - start < timeout:
+        elapsed = int(_t.time() - start)
+        if sys.platform == "win32":
+            _refresh_path_windows()
+        if check_docker_installed():
+            log_fn(f"[DOCKER] Docker found after {elapsed}s.", GREEN)
+            # Now check if daemon is actually running
+            if check_docker_running():
+                log_fn("[DOCKER] Docker daemon is running.", GREEN)
+                return True
+            log_fn(f"[DOCKER] Docker installed but daemon not ready yet ({elapsed}s)...", AMBER)
+        else:
+            if elapsed % 10 == 0 and elapsed > 0:
+                log_fn(f"[DOCKER] Still waiting... ({elapsed}s / {timeout}s)", AMBER)
+        _t.sleep(3)
+    log_fn(f"[DOCKER] Docker not available after {timeout}s.", RED)
+    log_fn("[DOCKER] Start Docker Desktop manually, then press [S] to refresh.", AMBER)
+    return False
+
 def install_docker(log_fn):
     if sys.platform == "win32":
+        # Check if already installed but just not in PATH or not started
+        _refresh_path_windows()
+        if check_docker_installed():
+            log_fn("[DOCKER] Docker is installed but daemon may not be running.", AMBER)
+            return start_docker_desktop(log_fn)
+
+        # Step 1: Ensure WSL2 is available (Docker Desktop requires it)
+        log_fn("[DOCKER] Checking WSL2 dependency...", AMBER)
+        ensure_wsl(log_fn)
+
+        # Step 2: Install Docker Desktop via winget (all prompts suppressed)
         log_fn("[DOCKER] Installing Docker Desktop via winget — this may take several minutes ...", AMBER)
         code, out = run_cmd_stream([
             "winget", "install", "Docker.DockerDesktop",
-            "--silent", "--accept-package-agreements",
+            "--silent",
+            "--accept-package-agreements",
             "--accept-source-agreements",
+            "--disable-interactivity",
         ], cwd=None, log_fn=log_fn, label="[INSTALL]", timeout=600)
         if code == 0:
-            log_fn("[DOCKER] Installed! Start Docker Desktop, then retry.", GREEN)
-            return True
+            log_fn("[DOCKER] Installation complete.", GREEN)
+            _refresh_path_windows()
+            return start_docker_desktop(log_fn)
         log_fn("[DOCKER] winget failed. Opening download page ...", AMBER)
         webbrowser.open("https://docs.docker.com/desktop/install/windows-install/")
-        log_fn("[DOCKER] Install Docker Desktop, then retry.", AMBER)
+        log_fn("[DOCKER] Install Docker Desktop, start it, then press [S] to refresh.", AMBER)
         return False
     else:
         log_fn("[DOCKER] Installing Docker via get.docker.com — this may take several minutes ...", AMBER)
@@ -541,24 +744,87 @@ def read_last_destruction():
 # ══════════════════════════════════════════════════════════════════════════════
 
 class TerminalUI:
-    """Pure ANSI terminal interface — works on headless servers, SSH, etc."""
+    """btop++-inspired terminal dashboard for Kappa Roadmap deployment."""
 
-    # ANSI color codes
-    RST     = "\033[0m"
-    BOLD    = "\033[1m"
-    DIM     = "\033[2m"
-    T_CYAN  = "\033[96m"
-    T_GREEN = "\033[92m"
-    T_AMBER = "\033[93m"
-    T_RED   = "\033[91m"
-    T_MAG   = "\033[95m"
-    T_GRAY  = "\033[90m"
-    T_WHITE = "\033[97m"
-    T_BG    = "\033[40m"
+    import time as _time_mod  # class-level import avoids __import__ hack
+
+    # ── ANSI ──────────────────────────────────────────────────────────────
+    RST   = "\033[0m"
+    BOLD  = "\033[1m"
+    DIM   = "\033[2m"
+    ITAL  = "\033[3m"
+    ULINE = "\033[4m"
+
+    # 256-color shortcuts  \033[38;5;Nm
+    @staticmethod
+    def _fg(n): return f"\033[38;5;{n}m"
+
+    # Named palette (btop-inspired)
+    C_CYAN    = "\033[38;5;81m"    # bright teal
+    C_GREEN   = "\033[38;5;77m"    # soft green
+    C_AMBER   = "\033[38;5;214m"   # warm amber
+    C_RED     = "\033[38;5;196m"   # bright red
+    C_MAG     = "\033[38;5;170m"   # magenta/pink
+    C_BLUE    = "\033[38;5;69m"    # steel blue
+    C_WHITE   = "\033[38;5;255m"   # bright white
+    C_GRAY    = "\033[38;5;242m"   # mid gray
+    C_DGRAY   = "\033[38;5;236m"   # dark gray (borders)
+    C_LGRAY   = "\033[38;5;249m"   # light gray (text)
+    C_ORANGE  = "\033[38;5;208m"   # orange accent
+    C_PURPLE  = "\033[38;5;141m"   # lavender
+
+    # Box-drawing (rounded corners like btop)
+    TL = "\u256d"; TR = "\u256e"; BL = "\u2570"; BR = "\u256f"
+    H  = "\u2500"; V  = "\u2502"
+    TJ = "\u252c"; BJ = "\u2534"; LJ = "\u251c"; RJ = "\u2524"; CJ = "\u253c"
+
+    # Graph blocks (high-res: 8 levels)
+    BLOCKS = " \u2581\u2582\u2583\u2584\u2585\u2586\u2587\u2588"
+
+    # Braille dots for ultra-fine sparklines (2-dot vertical resolution)
+    # Braille: lower dot = +0x40, upper dot = +0x01 (per column)
+    # We use a simplified 4-level encoding per column
+    BRAILLE_BASE = 0x2800
+
+    # Status icons
+    ICON_ON  = "\u25cf"   # ●
+    ICON_OFF = "\u25cb"   # ○
+    ICON_ARR = "\u25b8"   # ▸
+    ICON_DOT = "\u2022"   # •
+
+    # Gradient colors for sparklines (green → yellow → red)
+    SPARK_GRAD = [77, 77, 78, 114, 150, 186, 222, 214, 208, 196]
 
     STATUS_COLORS = {
-        "done": "\033[92m", "in-progress": "\033[96m", "active": "\033[96m",
-        "planned": "\033[93m", "blocked": "\033[91m",
+        "done": "\033[38;5;77m", "completed": "\033[38;5;77m",
+        "in-progress": "\033[38;5;81m", "active": "\033[38;5;81m",
+        "planned": "\033[38;5;214m", "pending": "\033[38;5;214m",
+        "blocked": "\033[38;5;196m", "cancelled": "\033[38;5;196m",
+    }
+    STATUS_ICONS = {
+        "done": "\u2713", "completed": "\u2713",
+        "in-progress": "\u25b8", "active": "\u25b8",
+        "planned": "\u25cb", "pending": "\u25cb",
+        "blocked": "\u2718", "cancelled": "\u2718",
+    }
+
+    # System states — tells the user exactly where things stand
+    STATE_NO_VIRT       = "no_virt"
+    STATE_NO_DOCKER     = "no_docker"
+    STATE_DOCKER_OFF    = "docker_off"
+    STATE_NO_PROJECT    = "no_project"
+    STATE_NO_CONTAINER  = "no_container"
+    STATE_STARTING      = "starting"
+    STATE_ONLINE        = "online"
+
+    STATE_LABELS = {
+        "no_virt":      ("Virtualization not available",  ""),
+        "no_docker":    ("Docker not installed",         "Press [D] to deploy — installer will guide you"),
+        "docker_off":   ("Docker daemon not running",    "Start Docker Desktop, then press [S] to refresh"),
+        "no_project":   ("No project files found",       "Press [D] to deploy from a backup"),
+        "no_container":  ("Container not running",        "Press [D] to deploy, or docker compose up manually"),
+        "starting":     ("Container starting up...",     "Waiting for app to respond — this takes 10-30s"),
+        "online":       ("",                              ""),
     }
 
     def __init__(self):
@@ -566,7 +832,7 @@ class TerminalUI:
         self.running = True
         self.poll_interval = self.cfg.get("poll_interval", 1000) / 1000.0
         self.port = self.cfg.get("port", 3000)
-        self.spark_width = self.cfg.get("sparkline_width", 50)
+        self.spark_width = 40
         self.cpu_hist = deque(maxlen=self.spark_width)
         self.ram_hist = deque(maxlen=self.spark_width)
         self.net_hist = deque(maxlen=self.spark_width)
@@ -576,6 +842,9 @@ class TerminalUI:
         self.last_tasks = None
         self.last_online = False
         self.log_lines = []
+        self._start_time = self._time_mod.time()
+        self._system_state = self.STATE_STARTING
+        self._state_since = self._time_mod.time()
         self._enable_ansi()
 
     def _enable_ansi(self):
@@ -589,116 +858,339 @@ class TerminalUI:
                 k32.SetConsoleMode(h, mode.value | 0x0004)
             except Exception:
                 pass
-        # Force UTF-8 output so box-drawing chars and sparklines work
         try:
             sys.stdout.reconfigure(encoding="utf-8", errors="replace")
         except Exception:
             pass
+        # Hide cursor
+        print("\033[?25l", end="", flush=True)
+
+    def _show_cursor(self):
+        print("\033[?25h", end="", flush=True)
 
     def _clear(self):
         print("\033[2J\033[H", end="")
 
-    def _get_term_width(self):
+    def _term_size(self):
         try:
-            return os.get_terminal_size().columns
+            c, r = os.get_terminal_size()
+            return max(c, 60), max(r, 20)
         except Exception:
-            return 80
+            return 80, 24
 
     def _log(self, msg, color=""):
-        """Print immediately so the user always sees what's happening,
-        AND buffer for next full-screen render."""
-        c = color or self.DIM
+        c = color or self.C_GRAY
         try:
             print(f"  {c}{msg}{self.RST}", flush=True)
         except Exception:
             pass
         self.log_lines.append((msg, color))
-        if len(self.log_lines) > 8:
-            self.log_lines = self.log_lines[-8:]
+        if len(self.log_lines) > 12:
+            self.log_lines = self.log_lines[-12:]
 
-    def _hline(self, w):
-        return f"{self.T_GRAY}{chr(0x2500) * w}{self.RST}"
+    # ── BOX DRAWING HELPERS ───────────────────────────────────────────────
+
+    def _box_top(self, w, title="", color=""):
+        c = color or self.C_DGRAY
+        tc = self.C_CYAN if title else ""
+        inner = w - 2
+        if title:
+            t = f" {tc}{self.BOLD}{title}{self.RST}{c} "
+            pad = inner - len(title) - 2
+            return f"{c}{self.TL}{self.H}{t}{self.H * max(pad, 0)}{self.TR}{self.RST}"
+        return f"{c}{self.TL}{self.H * inner}{self.TR}{self.RST}"
+
+    def _box_mid(self, w, title="", color=""):
+        c = color or self.C_DGRAY
+        tc = self.C_GRAY
+        inner = w - 2
+        if title:
+            t = f" {tc}{title}{self.RST}{c} "
+            pad = inner - len(title) - 2
+            return f"{c}{self.LJ}{self.H}{t}{self.H * max(pad, 0)}{self.RJ}{self.RST}"
+        return f"{c}{self.LJ}{self.H * inner}{self.RJ}{self.RST}"
+
+    def _box_bot(self, w, color=""):
+        c = color or self.C_DGRAY
+        return f"{c}{self.BL}{self.H * (w - 2)}{self.BR}{self.RST}"
+
+    def _box_row(self, content, w, color=""):
+        c = color or self.C_DGRAY
+        # Strip ANSI to compute visible length
+        visible = re.sub(r'\033\[[0-9;]*m', '', content)
+        pad = max(w - 2 - len(visible), 0)
+        return f"{c}{self.V}{self.RST}{content}{' ' * pad}{c}{self.V}{self.RST}"
+
+    # ── SPARKLINE WITH GRADIENT COLOR ─────────────────────────────────────
+
+    def _gradient_spark(self, history, width, grad=None):
+        """Render a sparkline with per-bar gradient colors."""
+        grad = grad or self.SPARK_GRAD
+        data = list(history)
+        if len(data) < width:
+            data = [0.0] * (width - len(data)) + data
+        else:
+            data = data[-width:]
+        out = []
+        for v in data:
+            v = max(0, min(v, 100))
+            bidx = int(v / 100 * (len(self.BLOCKS) - 1))
+            cidx = int(v / 100 * (len(grad) - 1))
+            out.append(f"\033[38;5;{grad[cidx]}m{self.BLOCKS[bidx]}")
+        return "".join(out) + self.RST
+
+    # ── PROGRESS BAR ──────────────────────────────────────────────────────
+
+    def _bar(self, pct, width, filled_color, empty_color=""):
+        ec = empty_color or self.C_DGRAY
+        filled = int(pct / 100 * width)
+        empty = width - filled
+        return f"{filled_color}{'\u2588' * filled}{ec}{'\u2500' * empty}{self.RST}"
+
+    # ── UPTIME STRING ─────────────────────────────────────────────────────
+
+    def _uptime(self):
+        s = int(self._time_mod.time() - self._start_time)
+        if s < 60:
+            return f"{s}s"
+        if s < 3600:
+            return f"{s // 60}m{s % 60:02d}s"
+        return f"{s // 3600}h{(s % 3600) // 60:02d}m"
+
+    # ══════════════════════════════════════════════════════════════════════
+    #  MAIN RENDER
+    # ══════════════════════════════════════════════════════════════════════
 
     def _render(self):
         self._clear()
-        w = min(self._get_term_width(), 90)
-        C, G, A, R, D, M, W, RST = (self.T_CYAN, self.T_GREEN, self.T_AMBER,
-                                      self.T_RED, self.DIM, self.T_MAG, self.T_WHITE, self.RST)
-
-        # Header
-        print(f"{C}{self.BOLD}  KAPPA COMPUTER SYSTEMS{RST}")
-        print(f"{D}  DEPLOYMENT MANAGER // v2.1 \u2014 TERMINAL MODE{RST}")
-        print(self._hline(w))
-
-        # Status bar
-        online = self.last_online
+        W, H = self._term_size()
+        w = min(W, 100)
         s = self.last_stats
-        app_tag = f"{G}\u25cf ONLINE{RST}" if online else f"{R}\u25cf OFFLINE{RST}"
-        cpu_tag = f"{s['cpu']}" if s else "\u2014"
-        mem_tag = f"{s['mem']}" if s else "\u2014"
-        net_tag = f"{s['net_str']}" if s else "\u2014"
-        pids_tag = f"{s['pids']}" if s else "\u2014"
-        tasks_n = len(self.last_tasks) if self.last_tasks else "\u2014"
-        print(f"  APP {app_tag}  {D}|{RST}  CPU {A}{cpu_tag}{RST}  {D}|{RST}  RAM {C}{mem_tag}{RST}  {D}|{RST}  NET {M}{net_tag}{RST}  {D}|{RST}  PID {W}{pids_tag}{RST}  {D}|{RST}  TASKS {G}{tasks_n}{RST}")
-        print(self._hline(w))
-
-        # Task list
+        online = self.last_online
         tasks = self.last_tasks or []
-        print(f"  {C}{self.BOLD}TASKS{RST}")
-        if tasks:
-            print(f"  {D}{'ID':<5} {'STATUS':<14} {'TITLE':<50}{RST}")
-            for t in tasks[:15]:
-                tid = str(t.get("id", ""))[:4]
-                status = t.get("status", "unknown")
-                title = t.get("title", "\u2014")[:48]
-                sc = self.STATUS_COLORS.get(status, D)
-                print(f"  {D}{tid:<5}{RST} {sc}{status:<14}{RST} {W}{title}{RST}")
-            if len(tasks) > 15:
-                print(f"  {D}... and {len(tasks) - 15} more{RST}")
-        else:
-            print(f"  {D}(no tasks / app offline){RST}")
-        print(self._hline(w))
+        now_str = datetime.now().strftime("%H:%M:%S")
 
-        # Sparklines
-        sw = min(self.spark_width, w - 16)
-        cpu_spark = sparkline_str(self.cpu_hist, sw)
-        ram_spark = sparkline_str(self.ram_hist, sw)
-        net_spark = sparkline_str(self.net_hist, sw)
-        cpu_val = f"{self.last_stats['cpu_pct']:5.1f}%" if self.last_stats else "  \u2014  "
-        ram_val = f"{self.last_stats['mem_pct']:5.1f}%" if self.last_stats else "  \u2014  "
+        o = []  # output buffer — build then print once (less flicker)
+
+        # ── HEADER BAR ────────────────────────────────────────────────────
+        title = "KAPPA COMPUTER SYSTEMS"
+        sub = "DEPLOYMENT MANAGER"
+        ver = "v2.1"
+        right = f"{self.C_GRAY}{now_str}  {self.C_DGRAY}\u2502  {self.C_GRAY}up {self._uptime()}"
+        # Title line
+        o.append(f" {self.C_CYAN}{self.BOLD}{title}{self.RST}  "
+                 f"{self.C_DGRAY}{sub} {self.C_GRAY}{ver}  "
+                 f"{' ' * max(w - len(title) - len(sub) - len(ver) - len(now_str) - 22, 0)}"
+                 f"{right}{self.RST}")
+        o.append(f" {self.C_CYAN}{self.H * (w - 2)}{self.RST}")
+
+        # ── STATUS PANEL ─────────────────────────────────────────────────
+        o.append(self._box_top(w, "status"))
+        state = self._system_state
+        elapsed = self._state_elapsed()
+
+        if online:
+            app_s = f" {self.C_GREEN}{self.BOLD}{self.ICON_ON} ONLINE{self.RST}"
+        elif state == self.STATE_STARTING:
+            # Animated spinner for "starting" state
+            spin = ["\u280b", "\u2819", "\u2838", "\u2834", "\u2826", "\u2807"][elapsed % 6]
+            app_s = f" {self.C_AMBER}{spin} STARTING{self.RST} {self._fg(242)}({elapsed}s){self.RST}"
+        elif state == self.STATE_NO_DOCKER:
+            app_s = f" {self.C_RED}{self.ICON_OFF} NO DOCKER{self.RST}"
+        elif state == self.STATE_DOCKER_OFF:
+            app_s = f" {self.C_RED}{self.ICON_OFF} DOCKER STOPPED{self.RST}"
+        elif state == self.STATE_NO_PROJECT:
+            app_s = f" {self.C_AMBER}{self.ICON_OFF} NO PROJECT{self.RST}"
+        elif state == self.STATE_NO_CONTAINER:
+            app_s = f" {self.C_RED}{self.ICON_OFF} NOT DEPLOYED{self.RST}"
+        elif state == self.STATE_NO_VIRT:
+            app_s = f" {self.C_RED}{self.BOLD}\u2718 NO VIRTUALIZATION{self.RST}"
+        else:
+            app_s = f" {self.C_RED}{self.ICON_OFF} OFFLINE{self.RST}"
+
+        cpu_s = f"{self.C_AMBER}{s['cpu']}{self.RST}" if s else f"{self.C_DGRAY}--{self.RST}"
+        mem_s = f"{self.C_CYAN}{s['mem']}{self.RST}" if s else f"{self.C_DGRAY}--{self.RST}"
+        net_s = f"{self.C_MAG}{s['net_str']}{self.RST}" if s else f"{self.C_DGRAY}--{self.RST}"
+        pid_s = f"{self.C_LGRAY}{s['pids']}{self.RST}" if s else f"{self.C_DGRAY}-{self.RST}"
+        task_n = f"{self.C_GREEN}{len(tasks)}{self.RST}" if tasks else f"{self.C_DGRAY}0{self.RST}"
+
+        stat_line = (f"{app_s}  {self.C_DGRAY}\u2502{self.RST}  "
+                     f"{self.C_GRAY}cpu {cpu_s}  {self.C_DGRAY}\u2502{self.RST}  "
+                     f"{self.C_GRAY}mem {mem_s}  {self.C_DGRAY}\u2502{self.RST}  "
+                     f"{self.C_GRAY}net {net_s}  {self.C_DGRAY}\u2502{self.RST}  "
+                     f"{self.C_GRAY}pid {pid_s}  {self.C_DGRAY}\u2502{self.RST}  "
+                     f"{self.C_GRAY}tasks {task_n}")
+        o.append(self._box_row(f" {stat_line}", w))
+
+        # Contextual guidance line — tells the user what's happening and what to do
+        if state != self.STATE_ONLINE:
+            label, hint = self.STATE_LABELS.get(state, ("Unknown state", ""))
+            color = self.C_AMBER
+            if state == self.STATE_STARTING:
+                label = f"Container starting up... ({elapsed}s)"
+                if elapsed > 30:
+                    hint = "Taking longer than usual — check [D]ocker logs"
+            elif state == self.STATE_NO_VIRT:
+                color = self.C_RED
+                virt_detail = getattr(self, '_virt_detail', 'Unknown')
+                hint = virt_detail
+            o.append(self._box_row(
+                f"  {color}{self.ICON_ARR} {label}{self.RST}  "
+                f"{self._fg(242)}{hint}{self.RST}", w))
+
+        # Mini progress bars for CPU and RAM
+        if s:
+            cpu_pct = s['cpu_pct']
+            mem_pct = s['mem_pct']
+            bar_w = max(w - 30, 20)
+            cpu_bar = self._bar(cpu_pct, bar_w,
+                                self.C_GREEN if cpu_pct < 50 else self.C_AMBER if cpu_pct < 80 else self.C_RED)
+            mem_bar = self._bar(mem_pct, bar_w,
+                                self.C_CYAN if mem_pct < 60 else self.C_AMBER if mem_pct < 85 else self.C_RED)
+            o.append(self._box_row(f"  {self.C_GRAY}cpu {self._fg(242)}{cpu_pct:5.1f}%{self.RST}  {cpu_bar}", w))
+            o.append(self._box_row(f"  {self.C_GRAY}mem {self._fg(242)}{mem_pct:5.1f}%{self.RST}  {mem_bar}", w))
+        o.append(self._box_bot(w))
+
+        # ── GRAPHS PANEL ─────────────────────────────────────────────────
+        gw = min(self.spark_width, w - 14)
+        o.append(self._box_top(w, "graphs"))
+        # CPU sparkline
+        cpu_val = f"{s['cpu_pct']:5.1f}%" if s else "   -- "
+        cpu_spark = self._gradient_spark(self.cpu_hist, gw,
+                                         [77, 77, 114, 150, 186, 222, 214, 208, 202, 196])
+        o.append(self._box_row(f"  {self.C_GREEN}cpu{self.RST} {self._fg(242)}{cpu_val}{self.RST} {cpu_spark}", w))
+        # RAM sparkline
+        ram_val = f"{s['mem_pct']:5.1f}%" if s else "   -- "
+        ram_spark = self._gradient_spark(self.ram_hist, gw,
+                                         [81, 81, 75, 111, 147, 183, 219, 213, 207, 201])
+        o.append(self._box_row(f"  {self.C_CYAN}mem{self.RST} {self._fg(242)}{ram_val}{self.RST} {ram_spark}", w))
+        # NET sparkline
         if self.net_hist:
-            net_val = format_rate(self.net_hist[-1] / 100 * 1024**2)
+            nv = format_rate(self.net_hist[-1] / 100 * 1024**2)
         else:
-            net_val = "  \u2014  "
-        print(f"  {A}CPU {cpu_val}{RST}  {G}{cpu_spark}{RST}")
-        print(f"  {C}RAM {ram_val}{RST}  {C}{ram_spark}{RST}")
-        print(f"  {M}NET {net_val:>7}{RST}  {M}{net_spark}{RST}")
-        print(self._hline(w))
+            nv = "   -- "
+        net_spark = self._gradient_spark(self.net_hist, gw,
+                                         [170, 170, 171, 177, 183, 189, 225, 219, 213, 207])
+        o.append(self._box_row(f"  {self.C_MAG}net{self.RST} {self._fg(242)}{nv:>7}{self.RST} {net_spark}", w))
+        o.append(self._box_bot(w))
 
-        # Log
+        # ── TASKS PANEL ──────────────────────────────────────────────────
+        max_tasks = max(H - 22, 4)  # adaptive to terminal height
+        o.append(self._box_top(w, f"tasks ({len(tasks)})"))
+        if tasks:
+            # Header
+            hdr = (f"  {self._fg(242)}{'#':<4} "
+                   f"{'STATUS':<12} "
+                   f"{'TITLE':<{w - 24}}")
+            o.append(self._box_row(hdr, w))
+            o.append(self._box_mid(w))
+            for t in tasks[:max_tasks]:
+                tid = str(t.get("id", ""))[:3]
+                status = t.get("status", "unknown")
+                title = t.get("title", "")[:w - 26]
+                sc = self.STATUS_COLORS.get(status, self.C_GRAY)
+                icon = self.STATUS_ICONS.get(status, self.ICON_DOT)
+                row = (f"  {self._fg(242)}{tid:<4}{self.RST} "
+                       f"{sc}{icon} {status:<10}{self.RST} "
+                       f"{self.C_LGRAY}{title}{self.RST}")
+                o.append(self._box_row(row, w))
+            if len(tasks) > max_tasks:
+                more = f"  {self._fg(242)}{self.ITAL}... {len(tasks) - max_tasks} more{self.RST}"
+                o.append(self._box_row(more, w))
+        else:
+            # Context-aware empty state
+            if state == self.STATE_ONLINE:
+                empty_msg = "No tasks yet — add some in the admin panel"
+            elif state == self.STATE_STARTING:
+                empty_msg = f"App starting... tasks will appear shortly ({elapsed}s)"
+            elif state == self.STATE_NO_CONTAINER:
+                empty_msg = "No deployment — press [D] to deploy"
+            elif state == self.STATE_NO_VIRT:
+                vd = getattr(self, '_virt_detail', '')
+                if "WSL2" in vd:
+                    empty_msg = "Run 'wsl --install' in admin terminal, then reboot"
+                elif "BIOS" in vd:
+                    empty_msg = "Enable VT-x/AMD-V in BIOS, then reboot"
+                else:
+                    empty_msg = "Virtualization required for Docker"
+            elif state == self.STATE_NO_DOCKER:
+                empty_msg = "Docker required — press [D] for install guide"
+            elif state == self.STATE_DOCKER_OFF:
+                empty_msg = "Start Docker Desktop, then press [S] to refresh"
+            elif state == self.STATE_NO_PROJECT:
+                empty_msg = "No project files — press [D] to deploy from backup"
+            else:
+                empty_msg = "Connecting..."
+            o.append(self._box_row(f"  {self._fg(242)}{empty_msg}{self.RST}", w))
+        o.append(self._box_bot(w))
+
+        # ── LOG PANEL ────────────────────────────────────────────────────
         if self.log_lines:
-            for msg, color in self.log_lines[-6:]:
-                c = color or D
-                safe = msg.encode("ascii", "replace").decode()
-                print(f"  {c}{safe}{RST}")
-            print(self._hline(w))
+            o.append(self._box_top(w, "log"))
+            for msg, color in self.log_lines[-5:]:
+                c = color or self.C_GRAY
+                # Truncate to fit box
+                vis = msg[:w - 6]
+                o.append(self._box_row(f"  {c}{vis}{self.RST}", w))
+            o.append(self._box_bot(w))
 
-        # Destruction line
+        # ── DESTRUCTION LINE ─────────────────────────────────────────────
         last_d = read_last_destruction()
         if last_d:
-            print(f"  {R}{D}LAST DESTRUCTION: {last_d}{RST}")
-            print(self._hline(w))
+            o.append(f" {self._fg(52)}\u2718 LAST DESTRUCTION: {last_d}{self.RST}")
 
-        # Menu
-        print(f"  {W}{self.BOLD}COMMANDS:{RST}  "
-              f"{G}[D]{RST}eploy  "
-              f"{G}[E]{RST}xport  "
-              f"{A}[C]{RST}lose Shop  "
-              f"{R}[X]{RST} Destroy  "
-              f"{C}[S]{RST}tatus  "
-              f"{D}[H]{RST}elp  "
-              f"{D}[Q]{RST}uit")
-        print(f"  {D}> ", end="", flush=True)
+        # ── COMMAND BAR ──────────────────────────────────────────────────
+        o.append("")
+        o.append(
+            f" {self.C_DGRAY}{self.V}{self.RST} "
+            f"{self.C_GREEN}{self.BOLD}D{self.RST}{self._fg(242)}eploy "
+            f"{self.C_GREEN}{self.BOLD}E{self.RST}{self._fg(242)}xport "
+            f"{self.C_AMBER}{self.BOLD}C{self.RST}{self._fg(242)}lose "
+            f"{self.C_RED}{self.BOLD}X{self.RST}{self._fg(242)} Destroy "
+            f"{self.C_CYAN}{self.BOLD}S{self.RST}{self._fg(242)}ync "
+            f"{self.C_GRAY}{self.BOLD}H{self.RST}{self._fg(242)}elp "
+            f"{self.C_DGRAY}{self.BOLD}Q{self.RST}{self._fg(242)}uit"
+            f"{self.RST}"
+        )
+
+        # Print everything at once
+        print("\n".join(o), flush=True)
+
+    # ── SYSTEM DIAGNOSTICS ──────────────────────────────────────────────
+
+    def _diagnose(self):
+        """Determine current system state — called every poll cycle."""
+        old_state = self._system_state
+        # Cache virtualization check (expensive, won't change at runtime)
+        if not hasattr(self, '_virt_ok'):
+            self._virt_ok, self._virt_detail = check_virtualization()
+        if not self._virt_ok:
+            self._system_state = self.STATE_NO_VIRT
+        elif not check_docker_installed():
+            self._system_state = self.STATE_NO_DOCKER
+        elif self.last_online:
+            self._system_state = self.STATE_ONLINE
+        elif self.last_stats:
+            # Container running but app not responding yet
+            self._system_state = self.STATE_STARTING
+        else:
+            # No stats — is docker daemon running?
+            code, out = run_cmd([docker_exe(), "info"], timeout=5)
+            if code != 0:
+                self._system_state = self.STATE_DOCKER_OFF
+            elif find_installed() is None:
+                self._system_state = self.STATE_NO_PROJECT
+            else:
+                # Project exists, docker running, but no container
+                self._system_state = self.STATE_NO_CONTAINER
+        if self._system_state != old_state:
+            self._state_since = self._time_mod.time()
+
+    def _state_elapsed(self):
+        """Seconds since entering current state."""
+        return int(self._time_mod.time() - self._state_since)
+
+    # ── POLLING ───────────────────────────────────────────────────────────
 
     def _poll(self):
         stats = docker_stats()
@@ -707,7 +1199,7 @@ class TerminalUI:
         if stats:
             self.cpu_hist.append(stats["cpu_pct"])
             self.ram_hist.append(stats["mem_pct"])
-            now = __import__("time").time()
+            now = self._time_mod.time()
             net_total = stats["net_rx"] + stats["net_tx"]
             if self.prev_net is not None and self.prev_net_time is not None:
                 dt = now - self.prev_net_time
@@ -717,21 +1209,23 @@ class TerminalUI:
                     self.net_hist.append(max(rate_pct, 0))
             self.prev_net = net_total
             self.prev_net_time = now
+        self._diagnose()
 
     def _poll_tasks(self):
         tasks = fetch_tasks(self.port)
         if tasks is not None:
             self.last_tasks = tasks
 
+    # ── INPUT ─────────────────────────────────────────────────────────────
+
     def _get_key(self, timeout=None):
         if sys.platform == "win32":
             import msvcrt
-            import time as _time
-            deadline = _time.time() + (timeout or self.poll_interval)
-            while _time.time() < deadline:
+            deadline = self._time_mod.time() + (timeout or self.poll_interval)
+            while self._time_mod.time() < deadline:
                 if msvcrt.kbhit():
                     return msvcrt.getwch()
-                _time.sleep(0.05)
+                self._time_mod.sleep(0.05)
             return None
         else:
             import select as _select, termios, tty
@@ -747,60 +1241,78 @@ class TerminalUI:
                 termios.tcsetattr(fd, termios.TCSADRAIN, old)
 
     def _input(self, prompt):
+        self._show_cursor()
         print(self.RST, end="", flush=True)
-        return input(prompt)
+        try:
+            return input(prompt)
+        finally:
+            print("\033[?25l", end="", flush=True)  # hide cursor again
 
     def _confirm(self, msg):
-        resp = self._input(f"\n  {self.T_AMBER}{msg} [y/N]: {self.RST}")
+        resp = self._input(f"\n {self.C_AMBER}{msg} [y/N]: {self.RST}")
         return resp.strip().lower() in ("y", "yes", "yeah son")
+
+    # ── ACTIONS ───────────────────────────────────────────────────────────
 
     def _do_deploy(self):
         cwd = find_installed() or get_project_dir()
         backups = list_backups()
         if not backups:
-            self._log("[DEPLOY] No backups found.", self.T_RED)
+            self._log("No backups found. Use [C]lose Shop to create one, or --pack.", self.C_RED)
             return
-        print(f"\n  {self.T_CYAN}Available backups:{self.RST}")
+        print(f"\n {self.C_CYAN}{self.BOLD}Available backups:{self.RST}")
         for i, b in enumerate(backups[:5]):
             dt = b["mtime"].strftime("%Y-%m-%d %I:%M %p")
             sz = f"{b['size']/1024:.0f}KB"
-            tag = " (embedded)" if b.get("embedded") else ""
-            print(f"    {self.T_GREEN}[{i+1}]{self.RST} {dt}  {sz}{tag}")
-        choice = self._input(f"\n  Select backup [1-{min(len(backups),5)}] or Enter to cancel: ")
+            tag = f" {self._fg(242)}(embedded)" if b.get("embedded") else ""
+            marker = f"{self.C_GREEN}{self.ICON_ARR}" if i == 0 else f"{self.C_DGRAY} "
+            print(f"  {marker} {self.C_WHITE}[{i+1}]{self.RST} {self._fg(242)}{dt}  {sz}{tag}{self.RST}")
+        choice = self._input(f"\n {self._fg(242)}Select [1-{min(len(backups),5)}] or Enter to cancel: {self.RST}")
         try:
             idx = int(choice.strip()) - 1
             if idx < 0 or idx >= min(len(backups), 5):
                 return
         except (ValueError, IndexError):
             return
-        dest_choice = self._input(f"  Deploy to [{self.T_GREEN}H{self.RST}]ere ({cwd.name}) or enter a path: ")
+        dest_choice = self._input(
+            f" Deploy to [{self.C_GREEN}H{self.RST}]ere ({cwd.name}) or enter a path: ")
         dest = cwd if not dest_choice.strip() or dest_choice.strip().lower() == "h" else Path(dest_choice.strip())
-        self._log(f"[DEPLOY] Extracting to {dest} ...", self.T_AMBER)
-        extract_from_pyz(backups[idx]["path"], dest, lambda m, c=None: self._log(m, c or self.T_GREEN))
+        self._log(f"Extracting to {dest} ...", self.C_AMBER)
+        extract_from_pyz(backups[idx]["path"], dest, lambda m, c=None: self._log(m, c or self.C_GREEN))
         if not check_docker_installed():
-            self._log("[DOCKER] Docker not installed.", self.T_RED)
+            self._log("Docker not installed.", self.C_RED)
             if self._confirm("Attempt to install Docker?"):
-                install_docker(lambda m, c=None: self._log(m, c or self.T_AMBER))
-            return
-        docker_up(dest, lambda m, c=None: self._log(m, c or self.T_GREEN), self.cfg)
+                ok = install_docker(lambda m, c=None: self._log(m, c or self.C_AMBER))
+                if not ok:
+                    self._log("Docker install incomplete. Start Docker Desktop, then press [D] again.", self.C_AMBER)
+                    return
+                self._log("Docker ready — starting deployment...", self.C_GREEN)
+            else:
+                self._log("Docker required. Install it and press [D] when ready.", self.C_AMBER)
+                return
+        docker_up(dest, lambda m, c=None: self._log(m, c or self.C_GREEN), self.cfg)
 
     def _do_export(self):
         cwd = find_installed() or get_project_dir()
-        export_snapshot(cwd, lambda m, c=None: self._log(m, c or self.T_GREEN))
+        export_snapshot(cwd, lambda m, c=None: self._log(m, c or self.C_GREEN))
 
     def _do_close_shop(self):
         if not self._confirm("Close shop \u2014 stop app and create portable .pyz?"):
             return
         cwd = find_installed() or get_project_dir()
-        export_snapshot(cwd, lambda m, c=None: self._log(m, c or self.T_GREEN))
-        docker_down(cwd, lambda m, c=None: self._log(m, c or self.T_AMBER))
-        create_pyz(cwd, lambda m, c=None: self._log(m, c or self.T_GREEN))
+        snap = export_snapshot(cwd, lambda m, c=None: self._log(m, c or self.C_GREEN))
+        if snap is None:
+            self._log("WARNING: No database exported. Container data may be lost.", self.C_AMBER)
+        docker_down(cwd, lambda m, c=None: self._log(m, c or self.C_AMBER))
+        create_pyz(cwd, lambda m, c=None: self._log(m, c or self.C_GREEN))
 
     def _do_destroy(self):
-        print(f"\n  {self.T_RED}{self.BOLD}  U FO REAL!?{self.RST}")
-        resp = self._input(f"  Type '{self.T_RED}yeah son{self.RST}' to confirm: ")
+        print(f"\n {self.C_RED}{self.BOLD}  \u2718 U FO REAL!?{self.RST}")
+        print(f" {self._fg(242)}  This exports your DB, tears down the container,")
+        print(f" {self._fg(242)}  and deletes all app files. Cannot be undone.{self.RST}")
+        resp = self._input(f" {self.C_RED}Type 'yeah son' to confirm: {self.RST}")
         if resp.strip().lower() != "yeah son":
-            self._log("[DESTROY] Cancelled \u2014 hell naw.", self.T_AMBER)
+            self._log("Cancelled.", self.C_AMBER)
             return
         cwd = find_installed() or get_project_dir()
         who = get_username()
@@ -809,8 +1321,8 @@ class TerminalUI:
         if src.exists():
             fname = f"{who} destroyed everything on {ts}.json"
             shutil.copy2(src, get_backups_dir() / fname)
-            self._log(f"[DB] Safety export -> {fname}", self.T_GREEN)
-        docker_down(cwd, lambda m, c=None: self._log(m, c or self.T_AMBER))
+            self._log(f"Safety export -> {fname}", self.C_GREEN)
+        docker_down(cwd, lambda m, c=None: self._log(m, c or self.C_AMBER))
         if (cwd / COMPOSE).exists():
             try:
                 for item in cwd.iterdir():
@@ -820,18 +1332,94 @@ class TerminalUI:
                         shutil.rmtree(item)
                     else:
                         item.unlink()
-                self._log(f"[RM] Deleted app files in {cwd.name}", self.T_RED)
+                self._log(f"Deleted app files in {cwd.name}", self.C_RED)
             except Exception as e:
-                self._log(f"[RM] Error: {e}", self.T_RED)
+                self._log(f"Error: {e}", self.C_RED)
         log_destruction(who, ts)
-        self._log("[DESTROY] Done. Backups preserved.", self.T_AMBER)
+        self._log("Done. Backups preserved.", self.C_AMBER)
+
+    def _show_help(self):
+        print(f"\n{self._box_top(50, 'help')}")
+        cmds = [
+            ("D", "Deploy", "Extract .pyz + start Docker", self.C_GREEN),
+            ("E", "Export", "Snapshot database to backups/", self.C_GREEN),
+            ("C", "Close", "Export + stop + pack .pyz", self.C_AMBER),
+            ("X", "Destroy", "Safety export + full teardown", self.C_RED),
+            ("S", "Sync", "Force refresh all data", self.C_CYAN),
+            ("H", "Help", "This screen", self.C_GRAY),
+            ("Q", "Quit", "Exit the dashboard", self.C_GRAY),
+        ]
+        for key, name, desc, color in cmds:
+            print(self._box_row(
+                f"  {color}{self.BOLD}{key}{self.RST}  {self.C_LGRAY}{name:<9}{self.RST} {self._fg(242)}{desc}", 50))
+        print(self._box_bot(50))
+        self._input(f"\n {self._fg(242)}Press Enter...{self.RST}")
+
+    # ── MAIN LOOP ─────────────────────────────────────────────────────────
+
+    def _preflight(self):
+        """Startup health-check — visible checklist so the user knows exactly what's happening."""
+        # Virtualization check first (Windows-specific blocker)
+        virt_ok, virt_detail = check_virtualization()
+        checks = [
+            ("Virtualization support", lambda: virt_ok),
+            ("Docker installed", check_docker_installed),
+            ("Docker daemon running", check_docker_running),
+            ("Project files found", lambda: find_installed() is not None),
+            ("Container responding", lambda: docker_stats() is not None),
+            ("App online", lambda: check_app_online(self.port)),
+        ]
+        print(f"\n {self.C_CYAN}{self.BOLD}Preflight Check{self.RST}\n")
+        all_ok = True
+        for label, check_fn in checks:
+            print(f"  {self._fg(242)}{self.ICON_ARR} {label}...{self.RST}", end="", flush=True)
+            try:
+                ok = check_fn()
+            except Exception:
+                ok = False
+            if ok:
+                detail = ""
+                if label == "Virtualization support":
+                    detail = f" {self._fg(242)}({virt_detail}){self.RST}"
+                print(f"\r  {self.C_GREEN}\u2713 {label}{self.RST}{detail}          ")
+            else:
+                print(f"\r  {self.C_RED}\u2718 {label}{self.RST}          ")
+                all_ok = False
+                # Don't check downstream items if upstream failed
+                if label == "Virtualization support":
+                    print(f"  {self.C_RED}  {self.ICON_ARR} {virt_detail}{self.RST}")
+                    if "WSL2 not installed" in virt_detail:
+                        print(f"  {self.C_AMBER}  Fix: open an admin terminal and run:{self.RST}")
+                        print(f"  {self.C_WHITE}  wsl --install{self.RST}")
+                        print(f"  {self._fg(242)}  Then reboot and re-run this launcher.{self.RST}")
+                    elif "BIOS" in virt_detail:
+                        print(f"  {self.C_AMBER}  Fix: reboot into BIOS/UEFI and enable VT-x or AMD-V{self.RST}")
+                        print(f"  {self._fg(242)}  Usually under CPU Configuration or Advanced settings.{self.RST}")
+                    self._log("Cannot run Docker without virtualization.", self.C_RED)
+                    break
+                elif label == "Docker installed":
+                    self._log("Docker not found — press [D] to deploy (will offer install)", self.C_AMBER)
+                    break
+                elif label == "Docker daemon running":
+                    self._log("Docker daemon not running — start Docker Desktop, then press [S]", self.C_AMBER)
+                    self._log("Or press [D] to deploy (will auto-start Docker)", self.C_AMBER)
+                    break
+                elif label == "Project files found":
+                    self._log("No project files — press [D] to deploy from backup", self.C_AMBER)
+                    break
+                # Container/app not running is OK — just informational
+        if all_ok:
+            self._log("All systems go.", self.C_GREEN)
+        print(f"\n  {self._fg(242)}Entering dashboard in 2s...{self.RST}", flush=True)
+        self._time_mod.sleep(2)
 
     def run(self):
         if not sys.stdin.isatty():
-            print("Error: Terminal mode requires an interactive terminal (stdin is not a TTY).")
+            print("Error: Terminal mode requires an interactive terminal.")
             print("Use --help for options.")
             sys.exit(1)
-        self._log("[*] Terminal mode started. Polling...", self.T_CYAN)
+        self._preflight()
+        self._log("Dashboard started.", self.C_CYAN)
         task_counter = 0
         task_interval = 5
         try:
@@ -859,25 +1447,15 @@ class TerminalUI:
                 elif k == "s":
                     self._poll()
                     self._poll_tasks()
-                    self._log("[*] Refreshed.", self.T_CYAN)
-                elif k == "h" or k == "?":
+                    self._log("Refreshed.", self.C_CYAN)
+                elif k in ("h", "?"):
                     self._show_help()
         except KeyboardInterrupt:
             pass
+        finally:
+            self._show_cursor()
         self._clear()
-        print(f"{self.T_CYAN}  Bye.{self.RST}")
-
-    def _show_help(self):
-        H = self
-        print(f"\n{H.T_CYAN}{H.BOLD}  COMMANDS:{H.RST}")
-        print(f"  {H.T_GREEN}D{H.RST}  Deploy a .pyz backup (choose backup + target)")
-        print(f"  {H.T_GREEN}E{H.RST}  Export live database snapshot to backups/")
-        print(f"  {H.T_AMBER}C{H.RST}  Close Shop: export + stop Docker + pack .pyz")
-        print(f"  {H.T_RED}X{H.RST}  DESTROY: safety export + tear down + delete files")
-        print(f"  {H.T_CYAN}S{H.RST}  Force status refresh")
-        print(f"  {H.T_GRAY}Q{H.RST}  Quit")
-        print(f"  {H.T_GRAY}H/?{H.RST}  This help")
-        self._input(f"\n  {H.DIM}Press Enter to continue...{H.RST}")
+        print(f" {self.C_CYAN}Bye.{self.RST}")
 
 
 # ── CLI PACK (no GUI) ───────────────────────────────────────────────────────
@@ -1542,11 +2120,10 @@ class KappaLauncher(tk.Tk):
             return True
         self._log("[DOCKER] Not installed. Attempting auto-install ...", AMBER)
         if install_docker(self._log):
-            if check_docker_installed():
-                self._log("[DOCKER] Verified.", GREEN)
-                return True
-            self._log("[DOCKER] Installed but not in PATH. Restart this app.", AMBER)
-            return False
+            # install_docker now handles PATH refresh and waiting
+            self._log("[DOCKER] Ready.", GREEN)
+            return True
+        self._log("[DOCKER] Install incomplete. Start Docker Desktop and retry.", AMBER)
         return False
 
     def _do_deploy_here(self):
