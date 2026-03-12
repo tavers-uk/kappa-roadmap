@@ -151,6 +151,38 @@ def docker_stats():
     except Exception:
         return None
 
+def install_docker(log_fn):
+    """Auto-install Docker. Returns True on success."""
+    if sys.platform == "win32":
+        log_fn("[DOCKER] Attempting install via winget ...", AMBER)
+        code, out = run_cmd([
+            "winget", "install", "Docker.DockerDesktop",
+            "--silent", "--accept-package-agreements",
+            "--accept-source-agreements",
+        ], timeout=300)
+        if code == 0:
+            log_fn("[DOCKER] Installed! Start Docker Desktop, then retry.", GREEN)
+            return True
+        log_fn("[DOCKER] winget failed. Opening download page ...", AMBER)
+        webbrowser.open("https://docs.docker.com/desktop/install/windows-install/")
+        log_fn("[DOCKER] Install Docker Desktop, then retry.", AMBER)
+        return False
+    else:
+        log_fn("[DOCKER] Attempting install via get.docker.com ...", AMBER)
+        code, out = run_cmd(
+            ["bash", "-c", "curl -fsSL https://get.docker.com | sh"],
+            timeout=300,
+        )
+        if code == 0:
+            user = get_username()
+            run_cmd(["sudo", "usermod", "-aG", "docker", user], timeout=10)
+            log_fn(f"[DOCKER] Installed! Added {user} to docker group.", GREEN)
+            log_fn("[DOCKER] Log out & back in, then retry.", AMBER)
+            return True
+        log_fn("[DOCKER] Auto-install failed.", RED)
+        log_fn("[DOCKER] Try: curl -fsSL https://get.docker.com | sh", AMBER)
+        return False
+
 def check_app_online():
     try:
         urllib.request.urlopen(f"http://localhost:{PORT}/api/tasks", timeout=2)
@@ -230,7 +262,62 @@ def create_pyz(src_dir, log_fn):
 
     size_mb = dest.stat().st_size / (1024 * 1024)
     log_fn(f"[PACK] Done → {dest.name} ({size_mb:.1f} MB)", GREEN)
+    write_bootstrap_scripts(dest.parent, log_fn)
     return dest
+
+def write_bootstrap_scripts(target_dir, log_fn):
+    """Generate launch.bat and launch.sh alongside .pyz files."""
+    bat = target_dir / "launch.bat"
+    bat.write_text(
+        '@echo off\r\n'
+        'where python >nul 2>&1 && goto :run\r\n'
+        'echo [*] Python not found. Installing via winget...\r\n'
+        'winget install Python.Python.3.12 --silent --accept-package-agreements '
+        '--accept-source-agreements >nul 2>&1\r\n'
+        'if errorlevel 1 (\r\n'
+        '    echo [!] Auto-install failed. Get Python from https://python.org\r\n'
+        '    pause\r\n'
+        '    exit /b 1\r\n'
+        ')\r\n'
+        'echo [*] Python installed. Refreshing PATH...\r\n'
+        'set "PATH=%LOCALAPPDATA%\\Programs\\Python\\Python312;'
+        '%LOCALAPPDATA%\\Programs\\Python\\Python312\\Scripts;%PATH%"\r\n'
+        ':run\r\n'
+        'for %%f in ("%~dp0kappa-roadmap-*.pyz") do set "PYZ=%%f"\r\n'
+        'if not defined PYZ (\r\n'
+        '    echo [!] No .pyz file found next to this script.\r\n'
+        '    pause\r\n'
+        '    exit /b 1\r\n'
+        ')\r\n'
+        'echo [*] Launching %PYZ%...\r\n'
+        'python "%PYZ%"\r\n',
+        encoding="utf-8",
+    )
+    sh = target_dir / "launch.sh"
+    sh.write_text(
+        '#!/usr/bin/env bash\n'
+        'set -e\n'
+        'if ! command -v python3 &>/dev/null; then\n'
+        '    echo "[*] Python 3 not found. Installing..."\n'
+        '    if command -v apt-get &>/dev/null; then\n'
+        '        sudo apt-get update -qq && sudo apt-get install -y python3 python3-tk\n'
+        '    elif command -v dnf &>/dev/null; then\n'
+        '        sudo dnf install -y python3 python3-tkinter\n'
+        '    elif command -v pacman &>/dev/null; then\n'
+        '        sudo pacman -Sy --noconfirm python tk\n'
+        '    else\n'
+        '        echo "[!] Could not auto-install. Please install Python 3 manually."\n'
+        '        exit 1\n'
+        '    fi\n'
+        'fi\n'
+        'DIR="$(cd "$(dirname "$0")" && pwd)"\n'
+        'PYZ=$(ls -1t "$DIR"/kappa-roadmap-*.pyz 2>/dev/null | head -1)\n'
+        '[ -z "$PYZ" ] && { echo "[!] No .pyz file found."; exit 1; }\n'
+        'echo "[*] Launching $PYZ..."\n'
+        'python3 "$PYZ"\n',
+        encoding="utf-8",
+    )
+    log_fn("[PACK] Bootstrap scripts: launch.bat + launch.sh", GREEN)
 
 def extract_from_pyz(pyz_path, target, log_fn):
     """Extract app/ contents from a .pyz to target directory."""
@@ -590,7 +677,7 @@ class KappaLauncher(tk.Tk):
 
         # Boot messages
         if not check_docker_installed():
-            self._log("[WARN] Docker not found. Install Docker to deploy.", RED)
+            self._log("[WARN] Docker not found — will auto-install on first deploy.", AMBER)
         else:
             self._log("System ready. Docker detected.", GREEN)
         if is_running_from_pyz():
@@ -655,14 +742,27 @@ class KappaLauncher(tk.Tk):
             self._status_busy = False
 
     # ── ACTIONS ───────────────────────────────────────────────────────────────
+    def _ensure_docker(self):
+        """Check for Docker; auto-install if missing. Returns True if ready."""
+        if check_docker_installed():
+            return True
+        self._log("[DOCKER] Not installed. Attempting auto-install ...", AMBER)
+        if install_docker(self._log):
+            # Verify it actually works now
+            if check_docker_installed():
+                self._log("[DOCKER] Verified — ready to go.", GREEN)
+                return True
+            self._log("[DOCKER] Installed but not yet in PATH. Restart this app.", AMBER)
+            return False
+        return False
+
     def _do_deploy_here(self):
         def _go():
             sel = self._backup_tree.get_selected()
             if not sel:
                 self._log("[ERROR] No backup selected. Use 'Close Shop' to create one.", RED)
                 return
-            if not check_docker_installed():
-                self._log("[ERROR] Docker not found. Install Docker first.", RED)
+            if not self._ensure_docker():
                 return
             target = find_installed() or get_project_dir() / APP_NAME
             extract_from_pyz(sel, target, self._log)
@@ -679,8 +779,7 @@ class KappaLauncher(tk.Tk):
             if not sel:
                 self._log("[ERROR] No backup selected.", RED)
                 return
-            if not check_docker_installed():
-                self._log("[ERROR] Docker not found.", RED)
+            if not self._ensure_docker():
                 return
             target = Path(dest) / APP_NAME
             extract_from_pyz(sel, target, self._log)
