@@ -3,8 +3,6 @@ KAPPA ROADMAP — Deployment Manager v2.1
 Cross-platform (Windows + Linux) — Python 3.8+
 Single-file .pyz portable packaging
 """
-import tkinter as tk
-from tkinter import filedialog
 import subprocess, shutil, zipfile, os, sys, json, io, re
 from pathlib import Path
 from datetime import datetime
@@ -401,8 +399,348 @@ def read_last_destruction():
         return None
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  UI COMPONENTS
+#  TERMINAL MODE (--terminal) — no Tkinter, no display server required
 # ══════════════════════════════════════════════════════════════════════════════
+
+class TerminalUI:
+    """Pure ANSI terminal interface — works on headless servers, SSH, etc."""
+
+    # ANSI color codes
+    RST     = "\033[0m"
+    BOLD    = "\033[1m"
+    DIM     = "\033[2m"
+    T_CYAN  = "\033[96m"
+    T_GREEN = "\033[92m"
+    T_AMBER = "\033[93m"
+    T_RED   = "\033[91m"
+    T_MAG   = "\033[95m"
+    T_GRAY  = "\033[90m"
+    T_WHITE = "\033[97m"
+    T_BG    = "\033[40m"
+
+    STATUS_COLORS = {
+        "done": "\033[92m", "in-progress": "\033[96m", "active": "\033[96m",
+        "planned": "\033[93m", "blocked": "\033[91m",
+    }
+
+    def __init__(self):
+        self.cfg = load_config()
+        self.running = True
+        self.poll_interval = self.cfg.get("poll_interval", 1000) / 1000.0
+        self.port = self.cfg.get("port", 3000)
+        self.spark_width = self.cfg.get("sparkline_width", 50)
+        self.cpu_hist = deque(maxlen=self.spark_width)
+        self.ram_hist = deque(maxlen=self.spark_width)
+        self.net_hist = deque(maxlen=self.spark_width)
+        self.prev_net = None
+        self.prev_net_time = None
+        self.last_stats = None
+        self.last_tasks = None
+        self.last_online = False
+        self.log_lines = []
+        self._enable_ansi()
+
+    def _enable_ansi(self):
+        if sys.platform == "win32":
+            try:
+                import ctypes
+                k32 = ctypes.windll.kernel32
+                h = k32.GetStdHandle(-11)
+                mode = ctypes.c_ulong()
+                k32.GetConsoleMode(h, ctypes.byref(mode))
+                k32.SetConsoleMode(h, mode.value | 0x0004)
+            except Exception:
+                pass
+        # Force UTF-8 output so box-drawing chars and sparklines work
+        try:
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+    def _clear(self):
+        print("\033[2J\033[H", end="")
+
+    def _get_term_width(self):
+        try:
+            return os.get_terminal_size().columns
+        except Exception:
+            return 80
+
+    def _log(self, msg, color=""):
+        self.log_lines.append((msg, color))
+        if len(self.log_lines) > 8:
+            self.log_lines = self.log_lines[-8:]
+
+    def _hline(self, w):
+        return f"{self.T_GRAY}{chr(0x2500) * w}{self.RST}"
+
+    def _render(self):
+        self._clear()
+        w = min(self._get_term_width(), 90)
+        C, G, A, R, D, M, W, RST = (self.T_CYAN, self.T_GREEN, self.T_AMBER,
+                                      self.T_RED, self.DIM, self.T_MAG, self.T_WHITE, self.RST)
+
+        # Header
+        print(f"{C}{self.BOLD}  KAPPA COMPUTER SYSTEMS{RST}")
+        print(f"{D}  DEPLOYMENT MANAGER // v2.1 \u2014 TERMINAL MODE{RST}")
+        print(self._hline(w))
+
+        # Status bar
+        online = self.last_online
+        s = self.last_stats
+        app_tag = f"{G}\u25cf ONLINE{RST}" if online else f"{R}\u25cf OFFLINE{RST}"
+        cpu_tag = f"{s['cpu']}" if s else "\u2014"
+        mem_tag = f"{s['mem']}" if s else "\u2014"
+        net_tag = f"{s['net_str']}" if s else "\u2014"
+        pids_tag = f"{s['pids']}" if s else "\u2014"
+        tasks_n = len(self.last_tasks) if self.last_tasks else "\u2014"
+        print(f"  APP {app_tag}  {D}|{RST}  CPU {A}{cpu_tag}{RST}  {D}|{RST}  RAM {C}{mem_tag}{RST}  {D}|{RST}  NET {M}{net_tag}{RST}  {D}|{RST}  PID {W}{pids_tag}{RST}  {D}|{RST}  TASKS {G}{tasks_n}{RST}")
+        print(self._hline(w))
+
+        # Task list
+        tasks = self.last_tasks or []
+        print(f"  {C}{self.BOLD}TASKS{RST}")
+        if tasks:
+            print(f"  {D}{'ID':<5} {'STATUS':<14} {'TITLE':<50}{RST}")
+            for t in tasks[:15]:
+                tid = str(t.get("id", ""))[:4]
+                status = t.get("status", "unknown")
+                title = t.get("title", "\u2014")[:48]
+                sc = self.STATUS_COLORS.get(status, D)
+                print(f"  {D}{tid:<5}{RST} {sc}{status:<14}{RST} {W}{title}{RST}")
+            if len(tasks) > 15:
+                print(f"  {D}... and {len(tasks) - 15} more{RST}")
+        else:
+            print(f"  {D}(no tasks / app offline){RST}")
+        print(self._hline(w))
+
+        # Sparklines
+        sw = min(self.spark_width, w - 16)
+        cpu_spark = sparkline_str(self.cpu_hist, sw)
+        ram_spark = sparkline_str(self.ram_hist, sw)
+        net_spark = sparkline_str(self.net_hist, sw)
+        cpu_val = f"{self.last_stats['cpu_pct']:5.1f}%" if self.last_stats else "  \u2014  "
+        ram_val = f"{self.last_stats['mem_pct']:5.1f}%" if self.last_stats else "  \u2014  "
+        if self.net_hist:
+            net_val = format_rate(self.net_hist[-1] / 100 * 1024**2)
+        else:
+            net_val = "  \u2014  "
+        print(f"  {A}CPU {cpu_val}{RST}  {G}{cpu_spark}{RST}")
+        print(f"  {C}RAM {ram_val}{RST}  {C}{ram_spark}{RST}")
+        print(f"  {M}NET {net_val:>7}{RST}  {M}{net_spark}{RST}")
+        print(self._hline(w))
+
+        # Log
+        if self.log_lines:
+            for msg, color in self.log_lines[-6:]:
+                c = color or D
+                safe = msg.encode("ascii", "replace").decode()
+                print(f"  {c}{safe}{RST}")
+            print(self._hline(w))
+
+        # Destruction line
+        last_d = read_last_destruction()
+        if last_d:
+            print(f"  {R}{D}LAST DESTRUCTION: {last_d}{RST}")
+            print(self._hline(w))
+
+        # Menu
+        print(f"  {W}{self.BOLD}COMMANDS:{RST}  "
+              f"{G}[D]{RST}eploy  "
+              f"{G}[E]{RST}xport  "
+              f"{A}[C]{RST}lose Shop  "
+              f"{R}[X]{RST} Destroy  "
+              f"{C}[S]{RST}tatus  "
+              f"{D}[Q]{RST}uit")
+        print(f"  {D}> ", end="", flush=True)
+
+    def _poll(self):
+        stats = docker_stats()
+        self.last_stats = stats
+        self.last_online = check_app_online(self.port)
+        if stats:
+            self.cpu_hist.append(stats["cpu_pct"])
+            self.ram_hist.append(stats["mem_pct"])
+            now = __import__("time").time()
+            net_total = stats["net_rx"] + stats["net_tx"]
+            if self.prev_net is not None and self.prev_net_time is not None:
+                dt = now - self.prev_net_time
+                if dt > 0:
+                    rate = (net_total - self.prev_net) / dt
+                    rate_pct = min(rate / (1024**2) * 100, 100)
+                    self.net_hist.append(max(rate_pct, 0))
+            self.prev_net = net_total
+            self.prev_net_time = now
+
+    def _poll_tasks(self):
+        tasks = fetch_tasks(self.port)
+        if tasks is not None:
+            self.last_tasks = tasks
+
+    def _get_key(self, timeout=None):
+        if sys.platform == "win32":
+            import msvcrt
+            import time as _time
+            deadline = _time.time() + (timeout or self.poll_interval)
+            while _time.time() < deadline:
+                if msvcrt.kbhit():
+                    return msvcrt.getwch()
+                _time.sleep(0.05)
+            return None
+        else:
+            import select as _select, termios, tty
+            fd = sys.stdin.fileno()
+            old = termios.tcgetattr(fd)
+            try:
+                tty.setcbreak(fd)
+                rlist, _, _ = _select.select([sys.stdin], [], [], timeout or self.poll_interval)
+                if rlist:
+                    return sys.stdin.read(1)
+                return None
+            finally:
+                termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+    def _input(self, prompt):
+        print(self.RST, end="", flush=True)
+        return input(prompt)
+
+    def _confirm(self, msg):
+        resp = self._input(f"\n  {self.T_AMBER}{msg} [y/N]: {self.RST}")
+        return resp.strip().lower() in ("y", "yes", "yeah son")
+
+    def _do_deploy(self):
+        cwd = find_installed() or get_project_dir()
+        backups = list_backups()
+        if not backups:
+            self._log("[DEPLOY] No backups found.", self.T_RED)
+            return
+        print(f"\n  {self.T_CYAN}Available backups:{self.RST}")
+        for i, b in enumerate(backups[:5]):
+            dt = b["mtime"].strftime("%Y-%m-%d %I:%M %p")
+            sz = f"{b['size']/1024:.0f}KB"
+            tag = " (embedded)" if b.get("embedded") else ""
+            print(f"    {self.T_GREEN}[{i+1}]{self.RST} {dt}  {sz}{tag}")
+        choice = self._input(f"\n  Select backup [1-{min(len(backups),5)}] or Enter to cancel: ")
+        try:
+            idx = int(choice.strip()) - 1
+            if idx < 0 or idx >= min(len(backups), 5):
+                return
+        except (ValueError, IndexError):
+            return
+        dest_choice = self._input(f"  Deploy to [{self.T_GREEN}H{self.RST}]ere ({cwd.name}) or enter a path: ")
+        dest = cwd if not dest_choice.strip() or dest_choice.strip().lower() == "h" else Path(dest_choice.strip())
+        self._log(f"[DEPLOY] Extracting to {dest} ...", self.T_AMBER)
+        extract_from_pyz(backups[idx]["path"], dest, lambda m, c=None: self._log(m, c or self.T_GREEN))
+        if not check_docker_installed():
+            self._log("[DOCKER] Docker not installed.", self.T_RED)
+            if self._confirm("Attempt to install Docker?"):
+                install_docker(lambda m, c=None: self._log(m, c or self.T_AMBER))
+            return
+        docker_up(dest, lambda m, c=None: self._log(m, c or self.T_GREEN), self.cfg)
+
+    def _do_export(self):
+        cwd = find_installed() or get_project_dir()
+        export_snapshot(cwd, lambda m, c=None: self._log(m, c or self.T_GREEN))
+
+    def _do_close_shop(self):
+        if not self._confirm("Close shop \u2014 stop app and create portable .pyz?"):
+            return
+        cwd = find_installed() or get_project_dir()
+        export_snapshot(cwd, lambda m, c=None: self._log(m, c or self.T_GREEN))
+        docker_down(cwd, lambda m, c=None: self._log(m, c or self.T_AMBER))
+        create_pyz(cwd, lambda m, c=None: self._log(m, c or self.T_GREEN))
+
+    def _do_destroy(self):
+        print(f"\n  {self.T_RED}{self.BOLD}  U FO REAL!?{self.RST}")
+        resp = self._input(f"  Type '{self.T_RED}yeah son{self.RST}' to confirm: ")
+        if resp.strip().lower() != "yeah son":
+            self._log("[DESTROY] Cancelled \u2014 hell naw.", self.T_AMBER)
+            return
+        cwd = find_installed() or get_project_dir()
+        who = get_username()
+        ts = datetime.now().strftime("%d-%m-%Y at %I-%M-%S %p")
+        src = cwd / DB_FILE
+        if src.exists():
+            fname = f"{who} destroyed everything on {ts}.json"
+            shutil.copy2(src, get_backups_dir() / fname)
+            self._log(f"[DB] Safety export -> {fname}", self.T_GREEN)
+        docker_down(cwd, lambda m, c=None: self._log(m, c or self.T_AMBER))
+        if (cwd / COMPOSE).exists():
+            try:
+                for item in cwd.iterdir():
+                    if item.name in {BACKUPS_DIR, "launcher.py"}:
+                        continue
+                    if item.is_dir():
+                        shutil.rmtree(item)
+                    else:
+                        item.unlink()
+                self._log(f"[RM] Deleted app files in {cwd.name}", self.T_RED)
+            except Exception as e:
+                self._log(f"[RM] Error: {e}", self.T_RED)
+        log_destruction(who, ts)
+        self._log("[DESTROY] Done. Backups preserved.", self.T_AMBER)
+
+    def run(self):
+        self._log("[*] Terminal mode started. Polling...", self.T_CYAN)
+        task_counter = 0
+        task_interval = 5
+        while self.running:
+            self._poll()
+            task_counter += 1
+            if task_counter >= task_interval:
+                self._poll_tasks()
+                task_counter = 0
+            self._render()
+            key = self._get_key(timeout=self.poll_interval)
+            if key is None:
+                continue
+            k = key.lower()
+            if k == "q":
+                self.running = False
+            elif k == "d":
+                self._do_deploy()
+            elif k == "e":
+                self._do_export()
+            elif k == "c":
+                self._do_close_shop()
+            elif k == "x":
+                self._do_destroy()
+            elif k == "s":
+                self._poll()
+                self._poll_tasks()
+                self._log("[*] Refreshed.", self.T_CYAN)
+        self._clear()
+        print(f"{self.T_CYAN}  Bye.{self.RST}")
+
+
+# ── CLI PACK (no GUI) ───────────────────────────────────────────────────────
+
+def _cli_pack():
+    def log_print(msg, _color=None):
+        print(msg.encode("ascii", "replace").decode())
+    src = Path(__file__).resolve().parent
+    if not (src / COMPOSE).exists():
+        print(f"[ERROR] No {COMPOSE} found in {src}")
+        sys.exit(1)
+    create_pyz(src, log_print)
+
+
+# ── EARLY EXIT for non-GUI modes (before tkinter import) ────────────────────
+
+if __name__ == "__main__" and len(sys.argv) > 1:
+    if sys.argv[1] == "--pack":
+        _cli_pack()
+        sys.exit(0)
+    elif sys.argv[1] in ("--terminal", "--tui", "-t"):
+        TerminalUI().run()
+        sys.exit(0)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  GUI (Tkinter) — only reaches here for GUI mode
+# ══════════════════════════════════════════════════════════════════════════════
+import tkinter as tk
+from tkinter import filedialog
 
 class Tooltip:
     def __init__(self, widget, text):
@@ -1114,22 +1452,11 @@ class KappaLauncher(tk.Tk):
             self._dest_lbl.config(text=f"LAST DESTRUCTION: {last}", fg=RED_DIM)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  ENTRY POINT
-# ══════════════════════════════════════════════════════════════════════════════
 
-def _cli_pack():
-    def log_print(msg, _color=None):
-        print(msg.encode("ascii", "replace").decode())
-    src = Path(__file__).resolve().parent
-    if not (src / COMPOSE).exists():
-        print(f"[ERROR] No {COMPOSE} found in {src}")
-        sys.exit(1)
-    create_pyz(src, log_print)
+# ══════════════════════════════════════════════════════════════════════════════
+#  GUI ENTRY POINT
+# ══════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1 and sys.argv[1] == "--pack":
-        _cli_pack()
-    else:
-        app = KappaLauncher()
-        app.mainloop()
+    app = KappaLauncher()
+    app.mainloop()
