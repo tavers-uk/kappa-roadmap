@@ -605,6 +605,13 @@ class TerminalUI:
             return 80
 
     def _log(self, msg, color=""):
+        """Print immediately so the user always sees what's happening,
+        AND buffer for next full-screen render."""
+        c = color or self.DIM
+        try:
+            print(f"  {c}{msg}{self.RST}", flush=True)
+        except Exception:
+            pass
         self.log_lines.append((msg, color))
         if len(self.log_lines) > 8:
             self.log_lines = self.log_lines[-8:]
