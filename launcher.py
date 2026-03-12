@@ -41,14 +41,15 @@ RED       = "#FF3030"
 RED_DIM   = "#7a1a1a"
 MAGENTA   = "#FF00A0"
 
-FONT_MONO   = ("Courier New", 11)
-FONT_HEAD   = ("Courier New", 15, "bold")
-FONT_BTN    = ("Courier New", 11, "bold")
-FONT_SMALL  = ("Courier New", 9)
-FONT_STATUS = ("Courier New", 10)
-FONT_TREE   = ("Courier New", 10)
-FONT_TABLE  = ("Courier New", 9)
-FONT_SPARK  = ("Courier New", 12)
+_MONO = "Courier New" if sys.platform == "win32" else "DejaVu Sans Mono"
+FONT_MONO   = (_MONO, 11)
+FONT_HEAD   = (_MONO, 15, "bold")
+FONT_BTN    = (_MONO, 11, "bold")
+FONT_SMALL  = (_MONO, 9)
+FONT_STATUS = (_MONO, 10)
+FONT_TREE   = (_MONO, 10)
+FONT_TABLE  = (_MONO, 9)
+FONT_SPARK  = (_MONO, 12)
 
 EXCLUDE_DIRS = {"node_modules", ".git", "backups", "__pycache__", ".claude"}
 EXCLUDE_EXTS = {".pyc", ".pyo"}
@@ -62,13 +63,23 @@ def load_config():
     p = _config_path()
     if p.exists():
         try:
-            return {**DEFAULT_CONFIG, **json.loads(p.read_text())}
+            raw = json.loads(p.read_text(encoding="utf-8"))
+            cfg = dict(DEFAULT_CONFIG)
+            if "port" in raw:
+                cfg["port"] = max(1024, min(int(raw["port"]), 65535))
+            if "poll_interval" in raw:
+                cfg["poll_interval"] = max(500, min(int(raw["poll_interval"]), 10000))
+            if "sparkline_width" in raw:
+                cfg["sparkline_width"] = max(10, min(int(raw["sparkline_width"]), 200))
+            if "auto_open_browser" in raw:
+                cfg["auto_open_browser"] = bool(raw["auto_open_browser"])
+            return cfg
         except Exception:
             pass
     return dict(DEFAULT_CONFIG)
 
 def save_config(cfg):
-    _config_path().write_text(json.dumps(cfg, indent=2))
+    _config_path().write_text(json.dumps(cfg, indent=2), encoding="utf-8")
 
 # ── PATH HELPERS ──────────────────────────────────────────────────────────────
 
@@ -115,7 +126,8 @@ def find_installed():
 def run_cmd(cmd, cwd=None, timeout=120):
     try:
         r = subprocess.run(cmd, cwd=str(cwd) if cwd else None,
-                           capture_output=True, text=True, timeout=timeout)
+                           capture_output=True, text=True, timeout=timeout,
+                           encoding="utf-8", errors="replace")
         return r.returncode, r.stdout + r.stderr
     except FileNotFoundError:
         return 1, f"Command not found: {cmd[0]}"
@@ -123,17 +135,17 @@ def run_cmd(cmd, cwd=None, timeout=120):
         return 1, f"Command timed out after {timeout}s"
 
 def run_cmd_stream(cmd, cwd, log_fn, label="", timeout=300):
-    """Run a command with live streaming output and elapsed-time updates.
-    Streams stdout/stderr line by line to log_fn. Shows elapsed time
-    every 3 seconds on lines with no output so the user always knows
-    something is happening. Returns (returncode, full_output)."""
+    """Run a command with live streaming output and elapsed-time heartbeat.
+    Uses a thread+queue approach that works on both Windows and Linux
+    (selectors.select does not support pipes on Windows)."""
     import time as _time
+    import queue
     log_fn(f"{label} Running: {' '.join(cmd)}", FG_DIM)
     try:
         proc = subprocess.Popen(
             cmd, cwd=str(cwd) if cwd else None,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, bufsize=1,
+            text=True, bufsize=1, encoding="utf-8", errors="replace",
         )
     except FileNotFoundError:
         log_fn(f"{label} Command not found: {cmd[0]}", RED)
@@ -142,42 +154,57 @@ def run_cmd_stream(cmd, cwd, log_fn, label="", timeout=300):
     output_lines = []
     start = _time.time()
     last_tick = start
+    line_q = queue.Queue()
 
     def elapsed():
         s = int(_time.time() - start)
-        if s < 60:
-            return f"{s}s"
-        return f"{s // 60}m {s % 60}s"
+        return f"{s // 60}m {s % 60}s" if s >= 60 else f"{s}s"
 
-    # Read line by line with periodic heartbeat
-    import selectors
-    sel = selectors.DefaultSelector()
-    sel.register(proc.stdout, selectors.EVENT_READ)
-    while True:
-        # Wait up to 3s for output
-        events = sel.select(timeout=3)
-        now = _time.time()
-        if events:
-            line = proc.stdout.readline()
-            if not line:
-                break  # EOF
+    # Reader thread — blocking readline works on all platforms
+    def _reader():
+        try:
+            for line in iter(proc.stdout.readline, ''):
+                line_q.put(line)
+        except Exception:
+            pass
+        finally:
+            line_q.put(None)  # sentinel
+
+    t = threading.Thread(target=_reader, daemon=True)
+    t.start()
+
+    try:
+        while True:
+            try:
+                line = line_q.get(timeout=3)
+            except queue.Empty:
+                now = _time.time()
+                if now - start > timeout:
+                    proc.kill()
+                    proc.wait()
+                    log_fn(f"{label} Timed out after {timeout}s", RED)
+                    return 1, "\n".join(output_lines)
+                if now - last_tick >= 3:
+                    log_fn(f"{label} ... working ({elapsed()} elapsed)", FG_DIM)
+                    last_tick = now
+                continue
+            if line is None:
+                break  # EOF sentinel
             line = line.rstrip()
             if line:
                 output_lines.append(line)
                 log_fn(f"{label} {line}", FG_DIM)
-                last_tick = now
-        else:
-            # No output for 3s — show heartbeat
-            if now - last_tick >= 3:
-                log_fn(f"{label} ... working ({elapsed()} elapsed)", FG_DIM)
-                last_tick = now
-        # Timeout guard
-        if now - start > timeout:
-            proc.kill()
-            sel.close()
-            log_fn(f"{label} Timed out after {timeout}s", RED)
-            return 1, "\n".join(output_lines)
-    sel.close()
+                last_tick = _time.time()
+            if _time.time() - start > timeout:
+                proc.kill()
+                proc.wait()
+                log_fn(f"{label} Timed out after {timeout}s", RED)
+                return 1, "\n".join(output_lines)
+    except Exception:
+        proc.kill()
+        proc.wait()
+        raise
+
     proc.wait()
     total = elapsed()
     log_fn(f"{label} Completed in {total} (exit {proc.returncode})", FG_DIM)
@@ -189,12 +216,31 @@ def check_docker_installed():
     code, _ = run_cmd(["docker", "--version"], timeout=10)
     return code == 0
 
+_COMPOSE_CMD = None
+def compose_cmd():
+    """Return compose command as list. Detects V2 plugin vs V1 standalone."""
+    global _COMPOSE_CMD
+    if _COMPOSE_CMD is not None:
+        return list(_COMPOSE_CMD)
+    # Try V2 plugin first (docker compose)
+    code, _ = run_cmd(["docker", "compose", "version"], timeout=5)
+    if code == 0:
+        _COMPOSE_CMD = ["docker", "compose"]
+        return list(_COMPOSE_CMD)
+    # Fall back to V1 standalone (docker-compose)
+    code, _ = run_cmd(["docker-compose", "version"], timeout=5)
+    if code == 0:
+        _COMPOSE_CMD = ["docker-compose"]
+        return list(_COMPOSE_CMD)
+    _COMPOSE_CMD = ["docker", "compose"]  # default
+    return list(_COMPOSE_CMD)
+
 def docker_up(cwd, log_fn, cfg=None):
     cfg = cfg or DEFAULT_CONFIG
     port = cfg.get("port", 3000)
     log_fn("[DOCKER] Building & starting container ...", AMBER)
     code, out = run_cmd_stream(
-        ["docker", "compose", "up", "-d", "--build"],
+        compose_cmd() + ["up", "-d", "--build"],
         cwd=cwd, log_fn=log_fn, label="[DOCKER]", timeout=600,
     )
     if code != 0:
@@ -208,7 +254,7 @@ def docker_up(cwd, log_fn, cfg=None):
 def docker_down(cwd, log_fn):
     log_fn("[DOCKER] Stopping container ...", AMBER)
     code, out = run_cmd_stream(
-        ["docker", "compose", "down"],
+        compose_cmd() + ["down"],
         cwd=cwd, log_fn=log_fn, label="[DOCKER]", timeout=120,
     )
     if code != 0:
@@ -297,7 +343,8 @@ def install_docker(log_fn):
 
 def check_app_online(port=3000):
     try:
-        urllib.request.urlopen(f"http://localhost:{port}/api/tasks", timeout=2)
+        resp = urllib.request.urlopen(f"http://localhost:{port}/api/tasks", timeout=2)
+        resp.close()
         return True
     except Exception:
         return False
@@ -305,8 +352,8 @@ def check_app_online(port=3000):
 def fetch_tasks(port=3000):
     """Fetch full task list from API. Returns list or None."""
     try:
-        resp = urllib.request.urlopen(f"http://localhost:{port}/api/tasks", timeout=2)
-        return json.loads(resp.read())
+        with urllib.request.urlopen(f"http://localhost:{port}/api/tasks", timeout=2) as resp:
+            return json.loads(resp.read())
     except Exception:
         return None
 
@@ -434,14 +481,22 @@ def write_bootstrap_scripts(target_dir, log_fn):
 def extract_from_pyz(pyz_path, target, log_fn):
     log_fn(f"[UNPACK] Extracting to {target} ...", CYAN)
     target.mkdir(parents=True, exist_ok=True)
+    resolved_target = target.resolve()
     with zipfile.ZipFile(str(pyz_path), 'r') as z:
         app_entries = [i for i in z.infolist()
                        if i.filename.startswith("app/") and len(i.filename) > 4]
         total = len(app_entries)
+        if total == 0:
+            log_fn("[UNPACK] WARNING: Archive contains no app files.", RED)
+            return False
         log_fn(f"[UNPACK] {total} files to extract ...", FG_DIM)
         for idx, info in enumerate(app_entries, 1):
             rel = info.filename[4:]
-            dest_path = target / rel
+            dest_path = (target / rel).resolve()
+            # Zip Slip protection — block path traversal
+            if not str(dest_path).startswith(str(resolved_target)):
+                log_fn(f"[UNPACK] BLOCKED unsafe path: {info.filename}", RED)
+                continue
             if info.filename.endswith('/'):
                 dest_path.mkdir(parents=True, exist_ok=True)
             else:
@@ -468,7 +523,7 @@ def export_snapshot(cwd, log_fn):
 # ── DESTRUCTION LOG ───────────────────────────────────────────────────────────
 
 def log_destruction(username, timestamp):
-    with open(get_backups_dir() / DESTRUCTION_LOG, 'a') as f:
+    with open(get_backups_dir() / DESTRUCTION_LOG, 'a', encoding="utf-8") as f:
         f.write(f"{username} // {timestamp}\n")
 
 def read_last_destruction():
@@ -476,7 +531,7 @@ def read_last_destruction():
     if not p.exists():
         return None
     try:
-        lines = [l.strip() for l in p.read_text().splitlines() if l.strip()]
+        lines = [l.strip() for l in p.read_text(encoding="utf-8").splitlines() if l.strip()]
         return lines[-1] if lines else None
     except Exception:
         return None
@@ -634,6 +689,7 @@ class TerminalUI:
               f"{A}[C]{RST}lose Shop  "
               f"{R}[X]{RST} Destroy  "
               f"{C}[S]{RST}tatus  "
+              f"{D}[H]{RST}elp  "
               f"{D}[Q]{RST}uit")
         print(f"  {D}> ", end="", flush=True)
 
@@ -764,36 +820,57 @@ class TerminalUI:
         self._log("[DESTROY] Done. Backups preserved.", self.T_AMBER)
 
     def run(self):
+        if not sys.stdin.isatty():
+            print("Error: Terminal mode requires an interactive terminal (stdin is not a TTY).")
+            print("Use --help for options.")
+            sys.exit(1)
         self._log("[*] Terminal mode started. Polling...", self.T_CYAN)
         task_counter = 0
         task_interval = 5
-        while self.running:
-            self._poll()
-            task_counter += 1
-            if task_counter >= task_interval:
-                self._poll_tasks()
-                task_counter = 0
-            self._render()
-            key = self._get_key(timeout=self.poll_interval)
-            if key is None:
-                continue
-            k = key.lower()
-            if k == "q":
-                self.running = False
-            elif k == "d":
-                self._do_deploy()
-            elif k == "e":
-                self._do_export()
-            elif k == "c":
-                self._do_close_shop()
-            elif k == "x":
-                self._do_destroy()
-            elif k == "s":
+        try:
+            while self.running:
                 self._poll()
-                self._poll_tasks()
-                self._log("[*] Refreshed.", self.T_CYAN)
+                task_counter += 1
+                if task_counter >= task_interval:
+                    self._poll_tasks()
+                    task_counter = 0
+                self._render()
+                key = self._get_key(timeout=self.poll_interval)
+                if key is None:
+                    continue
+                k = key.lower()
+                if k == "q":
+                    self.running = False
+                elif k == "d":
+                    self._do_deploy()
+                elif k == "e":
+                    self._do_export()
+                elif k == "c":
+                    self._do_close_shop()
+                elif k == "x":
+                    self._do_destroy()
+                elif k == "s":
+                    self._poll()
+                    self._poll_tasks()
+                    self._log("[*] Refreshed.", self.T_CYAN)
+                elif k == "h" or k == "?":
+                    self._show_help()
+        except KeyboardInterrupt:
+            pass
         self._clear()
         print(f"{self.T_CYAN}  Bye.{self.RST}")
+
+    def _show_help(self):
+        H = self
+        print(f"\n{H.T_CYAN}{H.BOLD}  COMMANDS:{H.RST}")
+        print(f"  {H.T_GREEN}D{H.RST}  Deploy a .pyz backup (choose backup + target)")
+        print(f"  {H.T_GREEN}E{H.RST}  Export live database snapshot to backups/")
+        print(f"  {H.T_AMBER}C{H.RST}  Close Shop: export + stop Docker + pack .pyz")
+        print(f"  {H.T_RED}X{H.RST}  DESTROY: safety export + tear down + delete files")
+        print(f"  {H.T_CYAN}S{H.RST}  Force status refresh")
+        print(f"  {H.T_GRAY}Q{H.RST}  Quit")
+        print(f"  {H.T_GRAY}H/?{H.RST}  This help")
+        self._input(f"\n  {H.DIM}Press Enter to continue...{H.RST}")
 
 
 # ── CLI PACK (no GUI) ───────────────────────────────────────────────────────
@@ -811,7 +888,18 @@ def _cli_pack():
 # ── EARLY EXIT for non-GUI modes (before tkinter import) ────────────────────
 
 if __name__ == "__main__" and len(sys.argv) > 1:
-    if sys.argv[1] == "--pack":
+    if sys.argv[1] in ("--help", "-h"):
+        print("KAPPA ROADMAP — Deployment Manager v2.1")
+        print()
+        print("Usage: python launcher.py [option]")
+        print()
+        print("  (no args)     Launch GUI (requires display / Tkinter)")
+        print("  --terminal    Launch terminal UI (headless/SSH safe)")
+        print("  --tui, -t     Same as --terminal")
+        print("  --pack        Create portable .pyz package (non-interactive)")
+        print("  --help, -h    Show this help")
+        sys.exit(0)
+    elif sys.argv[1] == "--pack":
         _cli_pack()
         sys.exit(0)
     elif sys.argv[1] in ("--terminal", "--tui", "-t"):
@@ -822,8 +910,20 @@ if __name__ == "__main__" and len(sys.argv) > 1:
 # ══════════════════════════════════════════════════════════════════════════════
 #  GUI (Tkinter) — only reaches here for GUI mode
 # ══════════════════════════════════════════════════════════════════════════════
-import tkinter as tk
-from tkinter import filedialog
+try:
+    import tkinter as tk
+    from tkinter import filedialog
+except (ImportError, ModuleNotFoundError):
+    print("ERROR: Tkinter not available. Use --terminal for headless mode.")
+    print("       On Linux: apt install python3-tk")
+    print("       Run: python launcher.py --help")
+    sys.exit(1)
+except Exception as e:
+    if "no display" in str(e).lower() or "DISPLAY" in str(e):
+        print("ERROR: No display found. Use --terminal for headless mode.")
+        print("       Run: python launcher.py --help")
+        sys.exit(1)
+    raise
 
 class Tooltip:
     def __init__(self, widget, text):
@@ -1217,6 +1317,7 @@ class KappaLauncher(tk.Tk):
         self._polling = True
         self._status_busy = False
         self._task_data = None
+        self._action_btns = []
         self._build_ui()
         self.eval('tk::PlaceWindow . center')
         self._poll_status()
@@ -1338,17 +1439,23 @@ class KappaLauncher(tk.Tk):
         w = "bold" if bold else "normal"
         bg_n = BG_DANGER if danger else BG
         bg_h = "#1a0808" if danger else "#1c1c1c"
-        b = tk.Button(parent, text=label, font=("Courier New", 11, w), bg=bg_n, fg=color,
-                      activebackground=bg_h, activeforeground=color, relief="flat",
-                      cursor="hand2", anchor="w", padx=12, pady=5, bd=0, command=cmd)
+        b = tk.Button(parent, text=label, font=FONT_BTN if not bold else (FONT_BTN[0], FONT_BTN[1], "bold"),
+                      bg=bg_n, fg=color, activebackground=bg_h, activeforeground=color,
+                      relief="flat", cursor="hand2", anchor="w", padx=12, pady=5, bd=0,
+                      command=cmd, disabledforeground="#444")
         b.pack(fill="x", pady=1)
-        b.bind("<Enter>", lambda e, _b=b: _b.config(bg=bg_h))
-        b.bind("<Leave>", lambda e, _b=b: _b.config(bg=bg_n))
+        b.bind("<Enter>", lambda e, _b=b: _b.config(bg=bg_h) if _b["state"] != "disabled" else None)
+        b.bind("<Leave>", lambda e, _b=b: _b.config(bg=bg_n) if _b["state"] != "disabled" else None)
         if tip:
             Tooltip(b, tip)
+        self._action_btns.append(b)
         return b
 
     def _log(self, msg, color=None):
+        """Thread-safe log — routes widget mutation to the main thread."""
+        self.after(0, self._log_impl, msg, color)
+
+    def _log_impl(self, msg, color=None):
         tag_map = {CYAN: "cyan", AMBER: "amber", GREEN: "green",
                    RED: "red", FG_DIM: "dim", FG: "fg"}
         self.log_box.configure(state="normal")
@@ -1356,8 +1463,25 @@ class KappaLauncher(tk.Tk):
         self.log_box.see("end")
         self.log_box.configure(state="disabled")
 
+    def _set_buttons_enabled(self, enabled):
+        state = "normal" if enabled else "disabled"
+        for btn in self._action_btns:
+            try:
+                btn.configure(state=state)
+            except Exception:
+                pass
+
     def _run_threaded(self, fn):
-        threading.Thread(target=fn, daemon=True).start()
+        """Run fn in a daemon thread. Disables action buttons while running."""
+        self._set_buttons_enabled(False)
+        def _wrapper():
+            try:
+                fn()
+            except Exception as e:
+                self._log(f"[ERROR] {e}", RED)
+            finally:
+                self.after(0, self._set_buttons_enabled, True)
+        threading.Thread(target=_wrapper, daemon=True).start()
 
     def _open_options(self):
         OptionsDialog(self, self._cfg, self._apply_config)
@@ -1458,12 +1582,22 @@ class KappaLauncher(tk.Tk):
         self._run_threaded(_go)
 
     def _do_close_shop(self):
+        from tkinter import messagebox
+        if not messagebox.askokcancel(
+            "Close Shop",
+            "This will stop the running app, export the database,\n"
+            "and create a portable .pyz archive.\n\nContinue?",
+            parent=self,
+        ):
+            return
         def _go():
             cwd = find_installed()
             if not cwd:
                 self._log("[ERROR] No installed app found.", RED)
                 return
-            export_snapshot(cwd, self._log)
+            snap = export_snapshot(cwd, self._log)
+            if snap is None:
+                self._log("[WARN] No database exported. Container data may be lost.", AMBER)
             docker_down(cwd, self._log)
             create_pyz(cwd, self._log)
             self._log("[DONE] Packed and ready to move.", GREEN)
