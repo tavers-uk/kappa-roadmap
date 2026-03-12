@@ -1,118 +1,124 @@
-# KAPPA ROADMAP — Deployment Guide
+# KAPPA ROADMAP
+
+Self-hosted internal project roadmap dashboard for Kappa Computer Systems.
+Retro-futuristic viewer frontend, password-protected admin panel, portable Docker deployment.
+
+---
 
 ## What's in the box
 
 ```
 kappa-roadmap/
-├── launcher.py          ← GUI launcher (Python/Tkinter)
-├── build.bat            ← Build launcher.exe on Windows
-├── build.sh             ← Build launcher binary on Linux
+├── launcher.py          ← TUI-styled deployment manager (Python/Tkinter)
+├── launch.bat           ← Windows bootstrap (auto-installs Python if missing)
+├── launch.sh            ← Linux bootstrap (auto-installs Python if missing)
+├── build.bat            ← Create portable .pyz package (Windows)
+├── build.sh             ← Create portable .pyz package (Linux)
 ├── server.js            ← Express API + static file server
-├── db.js                ← SQLite setup
-├── package.json         ← Node.js dependencies
+├── db.js                ← JSON flat-file storage
+├── package.json         ← Node.js dependencies (express + bcryptjs only)
 ├── Dockerfile
 ├── docker-compose.yml
-├── .env.example         ← Copy to .env and set your password
+├── .env.example
 ├── public/
-│   └── index.html       ← The viewer frontend (retro dashboard)
+│   └── index.html       ← Viewer frontend (retro dashboard)
 └── admin/
     └── index.html       ← Admin CRUD panel (password protected)
 ```
 
 ---
 
-## Quick Start (VS Code / local dev)
+## Quick Start (local dev)
 
 ```bash
 cp .env.example .env
 npm install
 npm start
 # → http://localhost:3000       (viewer)
-# → http://localhost:3000/admin  (admin panel, password: kappa2026)
+# → http://localhost:3000/admin  (admin, password: kappa2026)
 ```
 
 ---
 
-## Docker Deploy (any platform)
+## Docker Deploy
 
-### Linux
 ```bash
 cp .env.example .env
-# Edit .env and set ADMIN_PASSWORD
 docker compose up -d
 ```
 
-### Windows (Docker Desktop)
-```powershell
-copy .env.example .env
-# Edit .env and set ADMIN_PASSWORD
-docker compose up -d
+App: `http://localhost:3000` | Admin: `http://localhost:3000/admin`
+
+---
+
+## Portable Handoff (.pyz)
+
+The entire app packs into a **single `.pyz` file** — launcher + app + data.
+Take it to any machine with Python 3 + Docker and deploy.
+
+### Create a package
+
+**From the launcher GUI:** Click "Close Shop & Pack Up"
+
+**From CLI:**
+```bash
+python launcher.py --pack
 ```
 
-App runs at `http://localhost:3000`
-Admin at `http://localhost:3000/admin`
+Output lands in `backups/`:
+```
+backups/
+├── kappa-roadmap-20260312-141530.pyz   ← the portable package
+├── launch.bat                           ← Windows bootstrap
+└── launch.sh                            ← Linux bootstrap
+```
 
-### Change the port
-Edit `.env`:
+### Deploy on a new machine
+
+Copy the `.pyz` (and optionally `launch.bat`/`launch.sh`) to the target machine.
+
+```bash
+python kappa-roadmap-20260312-141530.pyz
 ```
-PORT=8080
-```
+
+The launcher opens → select the backup → Deploy → done.
+
+### Zero-install bootstrap
+
+If Python isn't installed on the target, use the bootstrap scripts:
+
+- **Windows:** `launch.bat` — auto-installs Python via winget, then runs the `.pyz`
+- **Linux:** `launch.sh` — auto-installs Python via apt/dnf/pacman, then runs the `.pyz`
+
+Docker is auto-installed by the launcher if missing (winget on Windows, get.docker.com on Linux).
 
 ---
 
 ## Launcher GUI
 
-The launcher provides a one-click deployment manager:
+TUI-styled deployment manager with live monitoring.
 
-1. **Unpack & Move In Here** — Extracts app to current directory, starts Docker
-2. **Unpack & Move In...** — Opens folder picker, then deploys there
-3. **Export Live Database** — Snapshots the DB to current directory (safe backup)
+| Feature | Description |
+|---|---|
+| **Status bar** | Live app status, CPU, RAM, task count with sparkline bars |
+| **Backup tree** | Last 5 packages with dates/sizes, radio-select |
+| **Deploy HERE** | Unpack selected backup to current dir, start Docker |
+| **Deploy SOMEWHERE ELSE** | Folder picker, then deploy |
+| **Export Live Snapshot** | Copy `roadmap.json` to backups/ |
+| **Close Shop & Pack Up** | Snapshot + docker down + create portable `.pyz` |
+| **DESTROY EVERYTHING** | "U FO REAL!?" dialog, exports safety backup, full teardown |
+| **Destruction audit** | Bottom line shows last destruction event + who did it |
 
-### DANGER ZONE
-4. **Close Shop, Pack Up, & Move Out** — DB backup → docker down → zip everything
-5. **~~ DESTROY EVERYTHING ~~** — Exports DB with timestamped filename, tears down container, deletes app files
-
-### Build the launcher
-
-**Windows:**
-```cmd
-build.bat
-# → dist\KCS-Roadmap-Launcher.exe
-```
-
-**Linux:**
-```bash
-chmod +x build.sh && ./build.sh
-# → dist/kcs-roadmap-launcher
-```
-
-To run without building: `python3 launcher.py` (requires Python 3.8+ with Tkinter)
+Run: `python launcher.py`
 
 ---
 
-## Moving / Migrating
+## Admin API
 
-Your entire persistent state lives in `data/roadmap.db` — a single SQLite file.
-
-**To migrate to a new host:**
-1. Use **"Close Shop, Pack Up"** in the launcher — it creates a `.zip`
-2. Copy the `.zip` to the new host
-3. Unzip, run `docker compose up -d`
-4. Done — all data intact
-
-**Manual backup:**
-```bash
-cp data/roadmap.db ~/backups/roadmap-$(date +%Y%m%d).db
-```
-
----
-
-## Admin API (for integrations)
-
-All admin routes require the `x-admin-token` header set to your `ADMIN_PASSWORD`.
+All admin routes require `x-admin-token` header set to your `ADMIN_PASSWORD`.
 
 | Method | Endpoint | Description |
-|--------|----------|-------------|
+|---|---|---|
 | GET | /api/tasks | Get all tasks (public) |
 | POST | /api/tasks | Add a task |
 | PUT | /api/tasks/:id | Update a task |
@@ -124,16 +130,29 @@ All admin routes require the `x-admin-token` header set to your `ADMIN_PASSWORD`
 
 ## Security Notes
 
-- The viewer (`/`) is **public** — no auth required — by design for internal network use
+- The viewer (`/`) is **public** — no auth — designed for internal network use
 - The admin panel (`/admin`) requires the password set in `.env`
-- For internet-facing deployment: put nginx in front with basic auth or VPN gate it
+- For internet-facing: put nginx in front with auth or VPN gate it
 - Change `ADMIN_PASSWORD` from the default `kappa2026` immediately
 
 ---
 
 ## Embedding in Halo PSA
 
-The viewer is a plain HTML page served at `http://[your-host]:3000`. You can embed it in Halo as an iframe using an HTML widget or a custom web tab. No additional configuration needed — the page auto-refreshes every 60 seconds.
+The viewer at `http://[your-host]:3000` can be embedded in Halo as an iframe via an HTML widget or custom web tab. Auto-refreshes every 60 seconds.
+
+---
+
+## Credits
+
+| Role | Credit |
+|---|---|
+| Creative Vision | Shiva |
+| Strategic Planning | Chad & Shiva |
+| Project Planning | Shiva & Claude Code |
+| Coding & Implementation | Claude Code |
+| Cross-Platform Design & Engineering | Shiva & Claude Code |
+| Deployment | Kappa Computer Systems LLC |
 
 ---
 
