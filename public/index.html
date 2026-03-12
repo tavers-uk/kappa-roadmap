@@ -1,0 +1,301 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>KCS // PROJECT ROADMAP</title>
+<link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=VT323&display=swap" rel="stylesheet">
+<style>
+:root{--bg:#050505;--panel:#0a0a0a;--cyan:#00FFE5;--magenta:#FF00A0;--amber:#FFB800;--green:#00FF41;--dim:#444;--text:#888;--border:#1a1a1a}
+*,*::before,*::after{margin:0;padding:0;box-sizing:border-box}
+html{scrollbar-width:thin;scrollbar-color:var(--border) var(--bg)}
+::-webkit-scrollbar{width:6px}::-webkit-scrollbar-track{background:var(--bg)}::-webkit-scrollbar-thumb{background:var(--border)}
+::selection{background:rgba(0,255,229,.2);color:var(--cyan)}
+body{font-family:'Share Tech Mono',monospace;background:var(--bg);color:var(--text);min-height:100vh;overflow-x:hidden}
+.gc{color:var(--cyan);text-shadow:0 0 7px var(--cyan),0 0 20px rgba(0,255,229,.2)}
+.gm{color:var(--magenta);text-shadow:0 0 7px var(--magenta),0 0 20px rgba(255,0,160,.2)}
+.ga{color:var(--amber);text-shadow:0 0 7px var(--amber),0 0 20px rgba(255,184,0,.2)}
+.gg{color:var(--green);text-shadow:0 0 7px var(--green),0 0 20px rgba(0,255,65,.2)}
+.scanlines{position:fixed;top:0;left:0;width:100%;height:100%;background:repeating-linear-gradient(0deg,transparent 0,transparent 2px,rgba(0,0,0,.1) 2px,rgba(0,0,0,.1) 4px);z-index:9999;pointer-events:none}
+.vignette{position:fixed;top:0;left:0;width:100%;height:100%;background:radial-gradient(ellipse at center,transparent 60%,rgba(0,0,0,.55) 100%);z-index:9998;pointer-events:none}
+/* boot */
+#boot{position:fixed;top:0;left:0;width:100%;height:100%;background:#000;z-index:10000;display:flex;align-items:center;justify-content:center;transition:opacity .3s}
+#boot .line{width:60%;height:2px;background:var(--cyan);box-shadow:0 0 15px var(--cyan);transition:height .5s,width .3s}
+#boot.exp .line{height:100vh;width:100%}
+#boot.done{opacity:0;pointer-events:none}
+@keyframes blink{0%,100%{opacity:1}50%{opacity:0}}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
+@keyframes flicker{0%{opacity:1}93%{opacity:1}93.5%{opacity:.85}94%{opacity:1}}
+@keyframes scroll-ticker{0%{transform:translateX(0)}100%{transform:translateX(-50%)}}
+@keyframes fadeIn{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:translateY(0)}}
+.blink{animation:blink 1.06s step-end infinite}
+.pulse{animation:pulse 2s ease-in-out infinite}
+.flicker{animation:flicker 5s infinite}
+#main{opacity:0;transition:opacity .4s}
+#main.on{opacity:1}
+/* header */
+.hdr{padding:10px 20px 8px;display:flex;justify-content:space-between;align-items:flex-start}
+.hdr-title{font-family:'VT323',monospace;font-size:2.6rem;line-height:1;letter-spacing:3px;color:var(--cyan);text-shadow:0 0 10px var(--cyan),0 0 30px rgba(0,255,229,.15)}
+.hdr-sub{font-size:.82rem;color:var(--amber);text-shadow:0 0 5px rgba(255,184,0,.15);margin-top:2px}
+.hdr-right{text-align:right;flex-shrink:0;padding-left:20px}
+.clk{font-family:'VT323',monospace;font-size:1.8rem;color:var(--cyan);text-shadow:0 0 8px var(--cyan);line-height:1}
+.hdr-meta{font-size:.72rem;color:var(--dim);margin-top:2px}
+.sep{padding:0 16px;color:var(--border);font-size:.65rem;overflow:hidden;white-space:nowrap;line-height:1;user-select:none}
+.sep-b{color:#333}
+.ph{font-family:'VT323',monospace;font-size:.95rem;padding:6px 16px 2px;letter-spacing:1px;user-select:none}
+/* stats */
+.stats{display:flex;gap:6px;padding:4px 16px 6px}
+.sb{flex:1;background:var(--panel);border:1px solid var(--border);text-align:center;padding:6px 4px;position:relative;overflow:hidden}
+.sb::before{content:'';position:absolute;top:0;left:0;right:0;height:1px}
+.sb:nth-child(1)::before{background:var(--cyan);box-shadow:0 0 8px var(--cyan)}
+.sb:nth-child(2)::before{background:var(--amber);box-shadow:0 0 8px var(--amber)}
+.sb:nth-child(3)::before{background:var(--green);box-shadow:0 0 8px var(--green)}
+.sb:nth-child(4)::before{background:var(--magenta);box-shadow:0 0 8px var(--magenta)}
+.sb-lbl{font-size:.68rem;color:var(--dim);letter-spacing:1px;text-transform:uppercase}
+.sb-val{font-family:'VT323',monospace;font-size:2.8rem;line-height:1.1}
+/* filters */
+.fbar{padding:5px 16px;display:flex;flex-wrap:wrap;gap:3px;align-items:center;border-bottom:1px solid var(--border)}
+.fsep{color:var(--border);margin:0 4px;font-size:.7rem;user-select:none}
+.fbtn{background:transparent;border:1px solid var(--border);color:var(--dim);font-family:'Share Tech Mono',monospace;padding:2px 8px;cursor:pointer;font-size:.74rem;transition:all .2s;white-space:nowrap;line-height:1.5}
+.fbtn:hover{border-color:#555;color:var(--text)}
+.fbtn.on[data-c="m"]{border-color:var(--magenta);color:var(--magenta);background:rgba(255,0,160,.06);text-shadow:0 0 7px rgba(255,0,160,.4)}
+.fbtn.on[data-c="c"]{border-color:var(--cyan);color:var(--cyan);background:rgba(0,255,229,.06);text-shadow:0 0 7px rgba(0,255,229,.4)}
+.fbtn.on[data-c="a"]{border-color:var(--amber);color:var(--amber);background:rgba(255,184,0,.06);text-shadow:0 0 7px rgba(255,184,0,.4)}
+.fbtn.on[data-c="g"]{border-color:var(--green);color:var(--green);background:rgba(0,255,65,.06);text-shadow:0 0 7px rgba(0,255,65,.4)}
+.fbtn.on[data-c="r"]{border-color:#f44;color:#f44;background:rgba(255,60,60,.06)}
+/* view bar */
+.vbar{padding:4px 16px;display:flex;gap:4px;align-items:center}
+.vbtn{background:transparent;border:1px solid var(--border);color:var(--dim);font-family:'Share Tech Mono',monospace;padding:2px 10px;cursor:pointer;font-size:.74rem;transition:all .2s}
+.vbtn:hover{border-color:#555;color:var(--text)}
+.vbtn.on{border-color:var(--cyan);color:var(--cyan);background:rgba(0,255,229,.06);text-shadow:0 0 5px rgba(0,255,229,.3)}
+#rc{font-size:.68rem;color:var(--dim);margin-left:12px}
+/* grid */
+.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:6px;padding:6px 16px}
+.card{background:var(--panel);border:1px solid var(--border);border-left:3px solid var(--dim);padding:9px 11px 8px;transition:all .2s;animation:fadeIn .3s ease both}
+.card:hover{transform:translateY(-1px)}
+.card.need{border-left-color:var(--magenta)}.card.need:hover{box-shadow:0 0 12px rgba(255,0,160,.1);border-color:rgba(255,0,160,.3)}
+.card.should{border-left-color:var(--cyan)}.card.should:hover{box-shadow:0 0 12px rgba(0,255,229,.1);border-color:rgba(0,255,229,.3)}
+.card.nice{border-left-color:var(--green)}.card.nice:hover{box-shadow:0 0 12px rgba(0,255,65,.1);border-color:rgba(0,255,65,.3)}
+.ctop{display:flex;justify-content:space-between;align-items:center;margin-bottom:4px}
+.sbadge{font-size:.68rem;text-transform:uppercase;letter-spacing:.5px}
+.s-prog{color:var(--cyan);text-shadow:0 0 5px rgba(0,255,229,.3)}
+.s-plan{color:var(--amber);text-shadow:0 0 5px rgba(255,184,0,.2)}
+.s-comp{color:var(--green);text-shadow:0 0 5px rgba(0,255,65,.3)}
+.s-blk{color:var(--magenta);text-shadow:0 0 5px rgba(255,0,160,.3)}
+.ett{font-size:.66rem;border:1px solid var(--dim);padding:0 5px;color:var(--dim);line-height:1.5}
+.cent{font-size:.88rem;color:#ccc;font-weight:700;margin-bottom:2px}
+.ctask{font-size:.76rem;color:var(--text);line-height:1.3;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}
+.cbot{display:flex;justify-content:space-between;align-items:flex-end;margin-top:6px;gap:4px}
+.ctags{font-size:.64rem;color:var(--dim);flex:1;line-height:1.6}
+.tag{display:inline-block;border:1px solid var(--border);padding:0 3px;margin-right:2px;margin-bottom:1px}
+.cplat{font-size:.64rem;color:var(--dim);white-space:nowrap;flex-shrink:0}
+/* timeline */
+#tl{padding:6px 16px;display:none}
+.tl-hd{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:4px}
+.tl-qh{font-family:'VT323',monospace;font-size:1rem;color:var(--amber);text-shadow:0 0 5px rgba(255,184,0,.2)}
+.tl-qh span{font-size:.75rem;color:var(--dim)}
+.tl-bd{display:grid;grid-template-columns:repeat(4,1fr);gap:8px}
+.tl-bar{height:24px;margin-bottom:2px;padding:0 6px;font-size:.7rem;line-height:24px;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;border-radius:2px;cursor:default;transition:filter .15s}
+.tl-bar:hover{filter:brightness(1.3)}
+.tl-bar.need{background:rgba(255,0,160,.18);color:var(--magenta);border-left:2px solid var(--magenta)}
+.tl-bar.should{background:rgba(0,255,229,.12);color:var(--cyan);border-left:2px solid var(--cyan)}
+.tl-bar.nice{background:rgba(0,255,65,.12);color:var(--green);border-left:2px solid var(--green)}
+.tl-empty{font-size:.72rem;color:#333;padding:4px 0}
+/* ticker */
+.ticker-wrap{overflow:hidden;border-top:1px solid var(--border);border-bottom:1px solid var(--border);background:rgba(255,184,0,.015);height:26px;display:flex;align-items:center}
+.ticker-track{display:flex;white-space:nowrap;animation:scroll-ticker 90s linear infinite;font-size:.72rem;color:var(--amber);text-shadow:0 0 4px rgba(255,184,0,.15)}
+.ticker-track span{padding:0 12px}
+/* footer */
+.footer{padding:6px 16px;font-size:.66rem;color:#333;display:flex;justify-content:space-between;flex-wrap:wrap;gap:4px}
+.empty{grid-column:1/-1;text-align:center;padding:40px;color:var(--dim);font-family:'VT323',monospace;font-size:1.2rem}
+@media(max-width:1050px){.grid{grid-template-columns:repeat(2,1fr)}}
+@media(max-width:700px){.grid{grid-template-columns:1fr}.hdr{flex-direction:column}.stats{flex-wrap:wrap}.sb{min-width:calc(50% - 4px)}}
+</style>
+</head>
+<body>
+<div id="boot"><div class="line"></div></div>
+<div class="scanlines"></div>
+<div class="vignette"></div>
+<div id="main">
+  <div class="hdr flicker">
+    <div>
+      <div class="hdr-title">KAPPA COMPUTER SYSTEMS<span class="blink" style="margin-left:4px">█</span></div>
+      <div class="hdr-sub">► PROJECT ROADMAP v2.6 &nbsp;║&nbsp; STATUS: <span class="gg">● ONLINE</span> &nbsp;║&nbsp; TERMINAL: KCS-ROADMAP-01</div>
+    </div>
+    <div class="hdr-right">
+      <div class="clk gc" id="clk">00:00:00</div>
+      <div class="hdr-meta" id="dt"></div>
+      <div class="hdr-meta">UPTIME: <span id="up" class="ga">0d 0h 0m 0s</span></div>
+    </div>
+  </div>
+  <div class="sep sep-b">╠══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════╣</div>
+  <div class="ph gc">╔══[ SYSTEM METRICS ]════════════════════════════════════════════════╗</div>
+  <div class="stats">
+    <div class="sb"><div class="sb-lbl">TOTAL</div><div class="sb-val gc" id="s-tot">0</div></div>
+    <div class="sb"><div class="sb-lbl">IN PROGRESS</div><div class="sb-val ga pulse" id="s-act">0</div></div>
+    <div class="sb"><div class="sb-lbl">COMPLETED</div><div class="sb-val gg" id="s-don">0</div></div>
+    <div class="sb"><div class="sb-lbl">BLOCKED</div><div class="sb-val gm" id="s-blk">0</div></div>
+  </div>
+  <div class="ph ga">╔══[ COMMAND INTERFACE ]═════════════════════════════════════════════╗</div>
+  <div class="fbar" id="fbar">
+    <span style="font-size:.68rem;color:var(--dim);margin-right:4px">CAT:</span>
+    <button class="fbtn" data-g="cat" data-v="Need to Have" data-c="m"><span class="fi">○</span> NEED</button>
+    <button class="fbtn" data-g="cat" data-v="Should Have" data-c="m"><span class="fi">○</span> SHOULD</button>
+    <button class="fbtn" data-g="cat" data-v="Nice to Have" data-c="m"><span class="fi">○</span> NICE</button>
+    <span class="fsep">│</span>
+    <span style="font-size:.68rem;color:var(--dim);margin-right:4px">QTR:</span>
+    <button class="fbtn" data-g="qtr" data-v="Q1 2026" data-c="a"><span class="fi">○</span> Q1</button>
+    <button class="fbtn" data-g="qtr" data-v="Q2 2026" data-c="a"><span class="fi">○</span> Q2</button>
+    <button class="fbtn" data-g="qtr" data-v="Q3 2026" data-c="a"><span class="fi">○</span> Q3</button>
+    <button class="fbtn" data-g="qtr" data-v="Q4 2026" data-c="a"><span class="fi">○</span> Q4</button>
+    <span class="fsep">│</span>
+    <span style="font-size:.68rem;color:var(--dim);margin-right:4px">STATUS:</span>
+    <button class="fbtn" data-g="status" data-v="IN PROGRESS" data-c="c"><span class="fi">○</span> IN PROGRESS</button>
+    <button class="fbtn" data-g="status" data-v="PLANNED" data-c="c"><span class="fi">○</span> PLANNED</button>
+    <button class="fbtn" data-g="status" data-v="COMPLETE" data-c="c"><span class="fi">○</span> COMPLETE</button>
+    <button class="fbtn" data-g="status" data-v="BLOCKED" data-c="c"><span class="fi">○</span> BLOCKED</button>
+    <span class="fsep">│</span>
+    <span style="font-size:.68rem;color:var(--dim);margin-right:4px">PLAT:</span>
+    <button class="fbtn" data-g="plat" data-v="NINJA RMM" data-c="g"><span class="fi">○</span> NINJA</button>
+    <button class="fbtn" data-g="plat" data-v="HALO PSA" data-c="g"><span class="fi">○</span> HALO</button>
+    <button class="fbtn" data-g="plat" data-v="HUDU" data-c="g"><span class="fi">○</span> HUDU</button>
+    <button class="fbtn" data-g="plat" data-v="ZSCALER" data-c="g"><span class="fi">○</span> ZSCALER</button>
+    <span class="fsep">│</span>
+    <button class="fbtn" data-action="clear" data-c="r"><span class="fi">✕</span> CLEAR</button>
+  </div>
+  <div class="vbar">
+    <span style="font-size:.68rem;color:var(--dim);margin-right:6px">VIEW:</span>
+    <button class="vbtn on" data-view="grid">▤ GRID</button>
+    <button class="vbtn" data-view="tl">▥ TIMELINE</button>
+    <span id="rc"></span>
+  </div>
+  <div class="ph gm" id="ghdr">╔══[ ACTIVE PROJECTS ]═══════════════════════════════════════════════╗</div>
+  <div class="grid" id="grid"></div>
+  <div id="tl"></div>
+  <div class="sep" style="margin-top:8px">──────────────────────────────────────────────────────────────────────────────────────────────</div>
+  <div class="ticker-wrap"><div class="ticker-track" id="ticker"></div></div>
+  <div class="sep">──────────────────────────────────────────────────────────────────────────────────────────────</div>
+  <div class="footer">
+    <span>║ KAPPA COMPUTER SYSTEMS LLC // INTERNAL USE ONLY // UNAUTHORIZED ACCESS PROHIBITED ║</span>
+    <span><span id="sync">LAST SYNC: --:--:--</span> // AUTO-REFRESH: 60s</span>
+  </div>
+</div>
+<script>
+const T0=Date.now();let DATA=[],VIEW='grid';
+const $=id=>document.getElementById(id);
+const esc=s=>String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+function pad(n){return String(n).padStart(2,'0');}
+
+// ── BOOT ──────────────────────────────────────────────────────────────────────
+(function boot(){
+  const bs=$('boot'),mc=$('main');
+  setTimeout(()=>bs.classList.add('exp'),150);
+  setTimeout(()=>{bs.classList.add('done');mc.classList.add('on');load();},900);
+})();
+
+// ── CLOCK ─────────────────────────────────────────────────────────────────────
+function tick(){
+  const n=new Date();
+  $('clk').textContent=pad(n.getHours())+':'+pad(n.getMinutes())+':'+pad(n.getSeconds());
+  $('dt').textContent=n.toLocaleDateString('en-US',{weekday:'short',year:'numeric',month:'short',day:'2-digit'}).toUpperCase();
+  const d=Math.floor((Date.now()-T0)/1000),h=Math.floor((d%86400)/3600),m=Math.floor((d%3600)/60),s=d%60;
+  $('up').textContent=Math.floor(d/86400)+'d '+h+'h '+m+'m '+s+'s';
+}
+tick();setInterval(tick,1000);
+
+// ── DATA ──────────────────────────────────────────────────────────────────────
+function load(){
+  fetch('/api/tasks').then(r=>r.json()).then(draw).catch(()=>draw([]));
+}
+setInterval(load,60000);
+
+function draw(data){
+  DATA=data;
+  countUp($('s-tot'),data.length);
+  countUp($('s-act'),data.filter(t=>t.status==='IN PROGRESS').length);
+  countUp($('s-don'),data.filter(t=>t.status==='COMPLETE').length);
+  countUp($('s-blk'),data.filter(t=>t.status==='BLOCKED').length);
+  const fd=filtered();
+  renderGrid(fd);renderTL(fd);
+  renderTicker(data);
+  $('rc').textContent='SHOWING '+fd.length+' OF '+data.length+' TASKS';
+  const n=new Date();
+  $('sync').textContent='LAST SYNC: '+pad(n.getHours())+':'+pad(n.getMinutes())+':'+pad(n.getSeconds());
+}
+
+function countUp(el,target,dur=1200){
+  if(!el||target===0){if(el)el.textContent='0';return;}
+  const ease=t=>1-Math.pow(1-t,4),s=performance.now();
+  (function f(now){const p=Math.min((now-s)/dur,1);el.textContent=Math.round(ease(p)*target);if(p<1)requestAnimationFrame(f);})(s);
+}
+
+// ── FILTER ────────────────────────────────────────────────────────────────────
+function filtered(){
+  const f={cat:[],qtr:[],status:[],plat:[]};
+  document.querySelectorAll('.fbtn.on').forEach(b=>{if(b.dataset.g&&b.dataset.v&&f[b.dataset.g])f[b.dataset.g].push(b.dataset.v);});
+  return DATA.filter(t=>{
+    if(f.cat.length&&!f.cat.includes(t.cat))return false;
+    if(f.qtr.length&&!f.qtr.includes(t.ett))return false;
+    if(f.status.length&&!f.status.includes(t.status))return false;
+    if(f.plat.length&&!f.plat.some(p=>t.platform.toUpperCase().includes(p)))return false;
+    return true;
+  });
+}
+
+// ── GRID ──────────────────────────────────────────────────────────────────────
+function renderGrid(fd){
+  const g=$('grid');
+  if(!fd.length){g.innerHTML='<div class="empty">╔═══════════════════════════╗<br>║ NO MATCHING TASKS FOUND ║<br>╚═══════════════════════════╝</div>';return;}
+  g.innerHTML=fd.map((t,i)=>{
+    const cc=t.cat==='Need to Have'?'need':t.cat==='Should Have'?'should':'nice';
+    let si,sc;
+    switch(t.status){case'IN PROGRESS':si='●';sc='s-prog pulse';break;case'COMPLETE':si='✓';sc='s-comp';break;case'BLOCKED':si='✕';sc='s-blk blink';break;default:si='○';sc='s-plan';}
+    const tags=(t.tags||'').split(',').map(x=>x.trim()).filter(Boolean).map(x=>'<span class="tag">#'+esc(x)+'</span>').join('');
+    return`<div class="card ${cc}" style="animation-delay:${i*25}ms">
+<div class="ctop"><span class="sbadge ${sc}">${si} ${esc(t.status)}</span><span class="ett">${esc(t.ett||'TBD')}</span></div>
+<div class="cent">${esc(t.entity)}</div>
+<div class="ctask">${esc(t.task)}</div>
+<div class="cbot"><div class="ctags">${tags}</div><span class="cplat">${esc(t.platform||'')}</span></div>
+</div>`;
+  }).join('');
+}
+
+// ── TIMELINE ─────────────────────────────────────────────────────────────────
+function renderTL(fd){
+  const el=$('tl');
+  const qs=['Q1 2026','Q2 2026','Q3 2026','Q4 2026'];
+  const grp={};qs.forEach(q=>grp[q]=[]);
+  fd.forEach(t=>{if(grp[t.ett])grp[t.ett].push(t);});
+  el.innerHTML=`<div class="ph gc">╔══[ TIMELINE VIEW ]═════════════════════════════════════════════════╗</div>
+<div class="tl-hd">${qs.map(q=>`<div class="tl-qh">${q} <span>(${grp[q].length})</span></div>`).join('')}</div>
+<div class="sep" style="padding:0;margin:0 0 6px">─────────────────────────────────────────────────────────────────────────────────</div>
+<div class="tl-bd">${qs.map(q=>grp[q].length?'<div>'+grp[q].map(t=>{const cc=t.cat==='Need to Have'?'need':t.cat==='Should Have'?'should':'nice';return`<div class="tl-bar ${cc}" title="${esc(t.task)}">${esc(t.entity)}</div>`;}).join('')+'</div>':'<div><div class="tl-empty">NO TASKS</div></div>').join('')}</div>`;
+}
+
+// ── TICKER ────────────────────────────────────────────────────────────────────
+function renderTicker(data){
+  const el=$('ticker');
+  const txt=data.map(t=>t.entity+': '+t.task).join(' ◆ ')+' ◆ ';
+  el.innerHTML='<span>'+esc(txt)+'</span><span>'+esc(txt)+'</span>';
+}
+
+// ── EVENTS ────────────────────────────────────────────────────────────────────
+document.addEventListener('click',e=>{
+  const fb=e.target.closest('.fbtn'),vb=e.target.closest('.vbtn');
+  if(fb){
+    if(fb.dataset.action==='clear'){document.querySelectorAll('.fbtn.on').forEach(b=>{b.classList.remove('on');const f=b.querySelector('.fi');if(f)f.textContent='○';});}
+    else{fb.classList.toggle('on');const f=fb.querySelector('.fi');if(f)f.textContent=fb.classList.contains('on')?'◉':'○';}
+    const fd=filtered();renderGrid(fd);renderTL(fd);
+    $('rc').textContent='SHOWING '+fd.length+' OF '+DATA.length+' TASKS';
+  }
+  if(vb){
+    VIEW=vb.dataset.view;
+    document.querySelectorAll('.vbtn').forEach(b=>b.classList.remove('on'));vb.classList.add('on');
+    $('grid').style.display=VIEW==='grid'?'':'none';
+    $('ghdr').style.display=VIEW==='grid'?'':'none';
+    $('tl').style.display=VIEW==='tl'?'block':'none';
+  }
+});
+</script>
+</body>
+</html>

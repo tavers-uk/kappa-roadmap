@@ -1,0 +1,12 @@
+services:
+  roadmap:
+    build: .
+    container_name: kappa-roadmap
+    restart: unless-stopped
+    ports:
+      - "${PORT:-3000}:3000"
+    volumes:
+      - ./data:/app/data
+    environment:
+      - PORT=3000
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD:-kappa2026}
